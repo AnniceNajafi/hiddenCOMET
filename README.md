@@ -1,7 +1,8 @@
 # hiddenCOMET
 
-**Continuous-Time Hidden Markov Models for EMT and Cellular Processes**
+**Hidden Markov Models for EMT and Cellular Processes**
 
+Access web application related to this project <a href="https://najafiannice.shinyapps.io/hiddenComet/">here</a>.
 
 
 `hiddenCOMET` is an R package that provides functions for fitting continuous-time Markov chain (CTMC) models with hidden states, specifically designed for analyzing epithelial-mesenchymal transition (EMT) dynamics coupled with secondary cellular processes such as cell cycle progression.

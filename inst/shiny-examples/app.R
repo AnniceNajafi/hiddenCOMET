@@ -10,14 +10,68 @@ suppressPackageStartupMessages({
   library(MASS)
 })
 
+
+library(httr)
+library(jsonlite)
+
+`%||%` <- function(a, b) if (!is.null(a) && nzchar(a)) a else b
+
+is_private_ip <- function(ip) {
+  grepl("^127\\.|^10\\.|^192\\.168\\.|^172\\.(1[6-9]|2[0-9]|3[0-1])\\.", ip) ||
+    grepl("^::1$|^fc00:|^fd00:|^fe80:", ip)
+}
+
+get_client_ip <- function(req) {
+  
+  xff <- req$HTTP_X_FORWARDED_FOR
+  if (!is.null(xff) && nzchar(xff)) {
+    return(trimws(strsplit(xff, ",")[[1]][1]))
+  }
+  xr <- req$HTTP_X_REAL_IP
+  if (!is.null(xr) && nzchar(xr)) return(xr)
+  req$REMOTE_ADDR %||% ""
+}
+
+
+geolocate_ip <- function(ip) {
+  if (!nzchar(ip) || is_private_ip(ip)) return(list(ok=FALSE, reason="private_or_empty"))
+  url <- sprintf("https://ipapi.co/%s/json/", ip)
+  tryCatch({
+    res <- httr::GET(url, timeout(3))
+    stop_for_status(res)
+    js <- fromJSON(rawToChar(content(res, "raw")))
+    if (!is.null(js$error) && isTRUE(js$error)) stop("api error")
+    list(
+      ok=TRUE,
+      ip = js$ip %||% ip,
+      city = js$city %||% "",
+      region = js$region %||% js$region_code %||% "",
+      country = js$country_name %||% js$country %||% "",
+      lat = as.numeric(js$latitude %||% js$lat %||% NA_real_),
+      lon = as.numeric(js$longitude %||% js$lon %||% NA_real_),
+      org = js$org %||% js$org_name %||% js$asn %||% ""
+    )
+  }, error = function(e) list(ok=FALSE, reason="lookup_failed"))
+}
+
 DEFAULT_OBSERVED_STATES <- c("G1", "S", "G2M")
 DEFAULT_HIDDEN_STATES <- c("E", "H", "M")
 DEFAULT_TOPOLOGY <- "linear"
 
 clean_names_safe <- function(df){
-  nm <- names(df); bad <- is.na(nm) | trimws(nm) == ""
-  if(any(bad)) nm[bad] <- paste0("col_", seq_len(sum(bad)))
-  names(df) <- make.names(nm, unique = TRUE); df
+  tryCatch({
+    nm <- names(df)
+    if(is.null(nm)) {
+      nm <- paste0("col_", seq_len(ncol(df)))
+    }
+    bad <- is.na(nm) | trimws(nm) == ""
+    if(any(bad)) nm[bad] <- paste0("col_", seq_len(sum(bad)))
+    names(df) <- make.names(nm, unique = TRUE)
+    df
+  }, error = function(e) {
+    cat("Error in clean_names_safe:", e$message, "\n")
+    df
+  })
 }
 
 proj_simplex <- function(v){
@@ -51,23 +105,27 @@ check_matrix_conditioning <- function(G) {
   })
 }
 
-build_G <- function(eta, states){
+build_G <- function(rates, states){
   n <- length(states)
-  G <- matrix(0, n, n)
-  dimnames(G) <- list(states, states)
   
-  if(n < 2) stop("Linear topology requires at least 2 states")
-  if(length(eta) != 2*(n-1)) stop("Linear topology requires 2*(n-1) parameters")
-  
-  k <- 1
-  for(i in 1:(n-1)){
-    G[i, i+1] <- exp(eta[k])
-    G[i, i] <- G[i, i] - exp(eta[k])
-    k <- k + 1
-    G[i+1, i] <- exp(eta[k])
-    G[i+1, i+1] <- G[i+1, i+1] - exp(eta[k])
-    k <- k + 1
+  if(n != 3 || !identical(states, c("E", "H", "M"))) {
+    stop("This function only works for 3 states: E, H, M")
   }
+  if(length(rates) != 4) {
+    stop("Need exactly 4 rates: c(muE, muM, lamE, lamM)")
+  }
+  
+  
+  muE  <- rates[1]  #E --> H
+  muM  <- rates[2]  #M --> H  
+  lamE <- rates[3]  #H --> E
+  lamM <- rates[4]  #H --> M
+  
+  G <- rbind(c(-muE,         muE,           0),
+             c(lamE,  -(lamE+lamM),      lamM),
+             c(0,            muM,        -muM))
+  
+  rownames(G) <- colnames(G) <- c("E", "H", "M")
   
   if(!check_matrix_conditioning(G)) {
     diag(G) <- diag(G) - 1e-6
@@ -76,15 +134,15 @@ build_G <- function(eta, states){
   G
 }
 
-negloglik_G_p0fixed <- function(theta_mat, B, times, eta, p0, states, N_pseudo = 3000){
+negloglik_G_p0fixed <- function(theta_mat, B, times, rates, p0, states, N_pseudo = 3000){
   n_states <- length(states)
   Theta <- apply(theta_mat, 2, function(x){
     x <- pmax(x, 0); s <- sum(x)
     if(s == 0) rep(1/n_states, n_states) else x/s
   })
-  Y <- round(N_pseudo * Theta) # pseudo-counts
+  Y <- round(N_pseudo * Theta)
   
-    G <- build_G(eta, states)
+    G <- build_G(rates, states)
   t0 <- min(times)
   
   tryCatch({
@@ -99,7 +157,7 @@ negloglik_G_p0fixed <- function(theta_mat, B, times, eta, p0, states, N_pseudo =
     nll <- 0
     for(i in seq_along(times)){
       pt <- St[[i]] %*% p0
-      th <- pmax(B %*% pt, 1e-12)   # predicted observed states from hidden states
+      th <- pmax(B %*% pt, 1e-12)   
       nll <- nll - sum(Y[, i] * log(th))
     }
     nll
@@ -108,28 +166,25 @@ negloglik_G_p0fixed <- function(theta_mat, B, times, eta, p0, states, N_pseudo =
   })
 }
 
-fit_G_given_p0 <- function(Theta, B, times, p0, states, starts = 30, N_pseudo = 3000, method = "Nelder-Mead"){
+fit_G_given_p0 <- function(Theta, B, times, p0, states, starts = 30, N_pseudo = 3000, method = "L-BFGS-B"){
   p0 <- proj_simplex(as.numeric(p0))
   best <- list(value = Inf, par = NULL)
   
   n <- length(states)
-  n_params <- 2 * (n - 1)  # Linear topology: 2*(n-1) parameters
+  n_params <- 2 * (n - 1)  
   
         for(s in seq_len(starts)){
-          if(method == "BFGS") {
-            init <- log(runif(n_params, 0.05, 0.2))  # very small range for BFGS
-            control_list <- list(maxit = 1000, reltol = 1e-6, abstol = 1e-6)
-          } else {
-            init <- log(runif(n_params, 0.01, 0.3))
-            control_list <- list(maxit = 3000, reltol = 1e-8)
-          }
+        
+          init <- runif(n_params, 0.01, 0.8)
           
           fit  <- optim(
             par = init,
             fn  = negloglik_G_p0fixed,
-            method = method,
+            method = "L-BFGS-B",
+            lower = rep(1e-5, n_params),
+            upper = rep(5, n_params),
             theta_mat = Theta, B = B, times = times, p0 = p0, states = states, N_pseudo = N_pseudo,
-            control = control_list
+            control = list(maxit = 5000)
           )
           if(fit$value < best$value && fit$value < 1e5) best <- fit  # avoid failed optimizations
         }
@@ -144,8 +199,23 @@ fit_G_given_p0 <- function(Theta, B, times, p0, states, starts = 30, N_pseudo = 
     })
   })
   P_hat <- sapply(St, function(S) as.numeric(S %*% p0))
-  P_hat <- apply(P_hat, 2, function(v){ v[v < 0] <- 0; v/sum(v) })
+  P_hat <- apply(P_hat, 2, function(v){ 
+    v[v < 0] <- 0
+    s <- sum(v)
+    if(s == 0 || is.na(s) || is.infinite(s)) {
+      cat("Warning: Trajectory sum is", s, "- using uniform distribution\n")
+      rep(1/length(v), length(v))  
+    } else {
+      v/s
+    }
+  })
   rownames(P_hat) <- states; colnames(P_hat) <- as.character(times)
+  
+  #Verify trajectories sum to 1
+  col_sums <- colSums(P_hat)
+  if(any(abs(col_sums - 1) > 1e-6)) {
+    cat("Warning: Some trajectory columns don't sum to 1:", col_sums, "\n")
+  }
   
   list(G = G_hat, p0 = p0, P = P_hat, par = best$par, value = best$value)
 }
@@ -203,18 +273,18 @@ estimate_B_mle <- function(Theta, P, observed_states, hidden_states, N = 2000L, 
   P     <- apply(P,     2, function(x){ x <- pmax(x,0); s <- sum(x); if (s==0) rep(1/n_hidden,n_hidden) else x/s })
   
   if (length(N) == 1) N <- rep(N, Tn)
-  Y <- sweep(Theta, 2, N, `*`)  # expected counts; using fractions is fine for MLE
+  Y <- sweep(Theta, 2, N, `*`)  
   
   nll <- function(par) {
-    B <- decode_B(par, observed_states, hidden_states)  # n_obs x n_hidden, col-stochastic
-    Th_hat <- B %*% P                                   # n_obs x T
-    -sum(Y * log(pmax(Th_hat, 1e-12)))                 # multinomial loglik (up to const)
+    B <- decode_B(par, observed_states, hidden_states)  
+    Th_hat <- B %*% P                                  
+    -sum(Y * log(pmax(Th_hat, 1e-12)))                
   }
   
   n_params <- n_obs * n_hidden
   best <- list(value = Inf, par = NULL)
   for (s in seq_len(starts)) {
-    par0 <- rnorm(n_params, 0, 0.2)  # small random logits around equal cols
+    par0 <- rnorm(n_params, 0, 0.2)  
     fit  <- optim(par0, nll, method = method,
                   control = list(maxit = 2000, reltol = 1e-10))
     if (fit$value < best$value) best <- fit
@@ -1006,6 +1076,22 @@ ui <- fluidPage(
       helpText("Θ: n_observed × T CSV with timepoints as columns."),
       fileInput("fileTheta", "Observed process Θ (CSV)", accept = c(".csv")),
       hr(),
+      h4("Load Demo Data"),
+      helpText("Select a cell line and treatment to automatically load pre-configured data:"),
+      selectInput("demoCellLine", "Demo Cell Line", 
+                  choices = c("Select a demo..." = "", 
+                             "A549 (Lung Cancer)" = "A549",
+                             "DU145 (Prostate Cancer)" = "DU145", 
+                             "MCF7 (Breast Cancer)" = "MCF7",
+                             "OVCA420 (Ovarian Cancer)" = "OVCA420"),
+                  selected = ""),
+      selectInput("demoTreatment", "Cell Cycle Treatment (for Θ data)", 
+                  choices = c("EGF" = "EGF", "TNF" = "TNF"),
+                  selected = "EGF"),
+      helpText("Note: B matrix and p0 are from TGF-β treatment; Θ (cell cycle) uses selected treatment."),
+      actionButton("loadDemo", "Load Demo Data", class = "btn-primary"),
+      actionButton("clearDemo", "Clear Demo Data", class = "btn-secondary"),
+      hr(),
       numericInput("Npseudo", "Pseudo-count N (for multinomial likelihood)", value = 3000, min = 100, step = 100),
       
       tags$head(
@@ -1016,6 +1102,40 @@ ui <- fluidPage(
 
       /* Dropdown options */
       .selectize-dropdown .option { color: #000 !important; }
+      
+      /* Demo buttons styling */
+      .btn-primary {
+        background: linear-gradient(135deg, #9ECAD6 0%, #7BB3C7 100%) !important;
+        border: none !important;
+        color: #2A1F35 !important;
+        font-weight: 500 !important;
+        padding: 10px 20px !important;
+        border-radius: 6px !important;
+        box-shadow: 0 4px 12px rgba(158, 202, 214, 0.3) !important;
+        transition: all 0.3s ease !important;
+      }
+      
+      .btn-primary:hover {
+        background: linear-gradient(135deg, #7BB3C7 0%, #9ECAD6 100%) !important;
+        box-shadow: 0 6px 16px rgba(158, 202, 214, 0.4) !important;
+        transform: translateY(-2px) !important;
+      }
+      
+      .btn-secondary {
+        background: rgba(158, 202, 214, 0.2) !important;
+        border: 1px solid rgba(158, 202, 214, 0.4) !important;
+        color: #9ECAD6 !important;
+        font-weight: 400 !important;
+        padding: 10px 20px !important;
+        border-radius: 6px !important;
+        transition: all 0.3s ease !important;
+      }
+      
+      .btn-secondary:hover {
+        background: rgba(158, 202, 214, 0.3) !important;
+        border-color: rgba(158, 202, 214, 0.6) !important;
+        color: #ffffff !important;
+      }
     "))
       ),
       
@@ -1025,7 +1145,7 @@ ui <- fluidPage(
     ),
     mainPanel(
       class = "main-panel",
-      tabsetPanel(
+      tabsetPanel(id = "tabs",
         tabPanel("Inputs",
                  h4("B (emission matrix)"),
                  DTOutput("tblB"),
@@ -1061,8 +1181,7 @@ ui <- fluidPage(
                    column(6,
                    h5("Hidden states trajectory data (P)"),
                    helpText("CSV with 4 columns: timepoints, Epithelial, Hybrid, Mesenchymal"),
-                   fileInput("fileEMT", "Hidden states trajectory (CSV)", accept = c(".csv")),
-                     numericInput("maxDayEMT", "Maximum day to include", value = 7, min = 1, max = 30)
+                   fileInput("fileEMT", "Hidden states trajectory (CSV)", accept = c(".csv"))
                    ),
                  column(6,
                    h5("Observed states data (Θ)"),
@@ -1131,7 +1250,29 @@ M,0.20,0.20,0.60
 )
 
 server <- function(input, output, session){
-  
+  observe({
+    ip <- get_client_ip(session$request)
+    
+    
+    if (is_private_ip(ip)) {
+      ip <- tryCatch(
+        fromJSON(rawToChar(httr::GET("https://api.ipify.org?format=json", timeout(3))$content))$ip,
+        error = function(e) ip
+      )
+    }
+    
+    geo <- geolocate_ip(ip)
+    ts <- format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")
+    
+    if (isTRUE(geo$ok)) {
+      cat(sprintf("[%s] New session from %s | %s, %s, %s | lat=%.5f lon=%.5f | org=%s\n",
+                  ts, geo$ip, geo$city, geo$region, geo$country,
+                  geo$lat, geo$lon, geo$org))
+    } else {
+      cat(sprintf("[%s] New session from %s | (no geo: %s)\n",
+                  ts, ip %||% "(unknown)", geo$reason %||% "n/a"))
+    }
+  })
   rx_observed_states <- reactive({
     if(!is.null(input$fileB)) {
       tryCatch({
@@ -1145,10 +1286,26 @@ server <- function(input, output, session){
           return(rownames(m))
         }
       }, error = function(e) {
+        cat("Error reading B matrix:", e$message, "\n")
       })
     }
     
-    states <- trimws(strsplit(input$observedStateNames, ",")[[1]])
+   
+    states <- c("state1", "state2", "state3")
+    
+
+    if(!is.null(input$observedStateNames) && !is.na(input$observedStateNames) && input$observedStateNames != "") {
+      tryCatch({
+        parsed_states <- strsplit(as.character(input$observedStateNames), ",")[[1]]
+        parsed_states <- trimws(parsed_states)
+        if(length(parsed_states) > 0 && !any(parsed_states == "")) {
+          states <- parsed_states
+        }
+      }, error = function(e) {
+        cat("Error parsing state names:", e$message, "\n")
+      })
+    }
+    
     states
   })
   
@@ -1157,9 +1314,38 @@ server <- function(input, output, session){
   })
   
   iv <- InputValidator$new()
-  iv$add_rule("fileB", sv_required(message = "Please upload B (CSV)."))
-  iv$add_rule("fileP0", sv_required(message = "Please upload p0 (CSV)."))
-  iv$add_rule("fileTheta", sv_required(message = "Please upload Θ (CSV)."))
+  
+  
+  iv$add_rule("fileB", function(value) {
+    if (demo_data$loaded && !is.null(demo_data$b_matrix)) {
+      return(NULL)  
+    }
+    if (is.null(value) || is.null(value$datapath)) {
+      return("Please upload B (CSV) or load demo data.")
+    }
+    return(NULL)  
+  })
+  
+  iv$add_rule("fileP0", function(value) {
+    if (demo_data$loaded && !is.null(demo_data$p0)) {
+      return(NULL)  
+    }
+    if (is.null(value) || is.null(value$datapath)) {
+      return("Please upload p0 (CSV) or load demo data.")
+    }
+    return(NULL)  
+  })
+  
+  iv$add_rule("fileTheta", function(value) {
+    if (demo_data$loaded && !is.null(demo_data$theta)) {
+      return(NULL)  
+    }
+    if (is.null(value) || is.null(value$datapath)) {
+      return("Please upload Θ (CSV) or load demo data.")
+    }
+    return(NULL)  
+  })
+  
   iv$enable()
   
   observe({
@@ -1176,8 +1362,17 @@ server <- function(input, output, session){
   iv_b$enable()
   
   rx_B <- reactive({
-    req(input$fileB)
-    df <- read.csv(input$fileB$datapath, check.names = FALSE) |> clean_names_safe()
+   
+    if (demo_data$loaded && !is.null(demo_data$b_matrix)) {
+      cat("Using demo B matrix...\n")
+      df <- demo_data$b_matrix
+    } else {
+      req(input$fileB)
+      cat("Reading B matrix from file...\n")
+      df <- read.csv(input$fileB$datapath, check.names = FALSE) |> clean_names_safe()
+    }
+    
+    cat("B raw dimensions:", nrow(df), "x", ncol(df), "\n")
     m <- as.matrix(df)
     if(!is.numeric(m[1,1]) && any(colnames(df) != "")){
       rn <- df[[1]]; df <- df[,-1, drop=FALSE]
@@ -1188,6 +1383,7 @@ server <- function(input, output, session){
      hidden_states <- rx_hidden_states()
      n_obs <- length(obs_states)
      
+     cat("B check - nrow:", nrow(m), "n_obs:", n_obs, "ncol:", ncol(m), "\n")
      if(nrow(m) != n_obs || ncol(m) != 3){
        stop(paste0("B matrix must be ", n_obs, "×3 (", n_obs, " observed states × 3 hidden states). Found ", nrow(m), "×", ncol(m)))
      }
@@ -1196,15 +1392,24 @@ server <- function(input, output, session){
     colnames(m) <- hidden_states
     
     for(j in seq_len(ncol(m))){
+      cat("Processing B column", j, "\n")
       colj <- pmax(as.numeric(m[,j]), 0)
       m[,j] <- proj_simplex(colj)
     }
+    cat("B matrix processed successfully\n")
     m
   })
   
   rx_p0 <- reactive({
-    req(input$fileP0)
-    df <- read.csv(input$fileP0$datapath, check.names = FALSE)
+    #Check if demo data is loaded first
+    if (demo_data$loaded && !is.null(demo_data$p0)) {
+      cat("Using demo p0 data...\n")
+      df <- demo_data$p0
+    } else {
+      req(input$fileP0)
+      df <- read.csv(input$fileP0$datapath, check.names = FALSE)
+    }
+    
     hidden_states <- rx_hidden_states()
     
     if(all(c("State","Value") %in% names(df))){
@@ -1229,8 +1434,15 @@ server <- function(input, output, session){
   })
   
   rx_Theta <- reactive({
-    req(input$fileTheta)
-    df <- read.csv(input$fileTheta$datapath, check.names = FALSE)
+    #Check if demo data is loaded first
+    if (demo_data$loaded && !is.null(demo_data$theta)) {
+      cat("Using demo Theta data...\n")
+      df <- demo_data$theta
+    } else {
+      req(input$fileTheta)
+      df <- read.csv(input$fileTheta$datapath, check.names = FALSE)
+    }
+    
     obs_states <- rx_observed_states()
     n_obs <- length(obs_states)
     
@@ -1240,7 +1452,7 @@ server <- function(input, output, session){
     
     
     time_col <- names(df)[1]
-    state_cols <- names(df)[-1]  # Remaining columns are observed states
+    state_cols <- names(df)[-1]  #Remaining columns are observed states
     
     if(length(state_cols) != n_obs) {
       stop(paste0("CSV should have ", n_obs, " state columns, but found ", length(state_cols), ". Expected states: ", paste(obs_states, collapse = ", ")))
@@ -1253,7 +1465,24 @@ server <- function(input, output, session){
     
     cat("After transposing - Matrix dimensions:", nrow(Theta), "x", ncol(Theta), "\n")
     
-    rownames(Theta) <- obs_states
+    #Map CSV column names to obs_states (handle variations like "G1_phase" vs "G1")
+    #First, try exact match
+    rownames(Theta) <- state_cols
+    
+
+    state_map <- setNames(state_cols, gsub("_phase$", "", tolower(state_cols)))
+    obs_lower <- tolower(obs_states)
+    
+    #Reorder Theta rows to match obs_states order
+    matched_idx <- match(obs_lower, names(state_map))
+    if(any(is.na(matched_idx))) {
+      cat("Warning: Could not match all observed states. Using original order.\n")
+      rownames(Theta) <- obs_states
+    } else {
+      Theta <- Theta[matched_idx, , drop = FALSE]
+      rownames(Theta) <- obs_states
+    }
+    
     colnames(Theta) <- as.character(times)
     
     Theta <- apply(Theta, 2, function(x){
@@ -1270,7 +1499,7 @@ server <- function(input, output, session){
     tnames <- colnames(th)
     tvec <- as.numeric(tnames)
     tvec <- sort(unique(tvec))
-    validate(need(length(tvec) >= 2, "Need at least two timepoints."))
+    shiny::validate(shiny::need(length(tvec) >= 2, "Need at least two timepoints."))
     tvec
   })
   
@@ -1293,16 +1522,13 @@ server <- function(input, output, session){
     names(df)[2:4] <- expected_cols
     emt_cols <- expected_cols
     
-    max_day <- input$maxDayEMT
+
     time_col_name <- names(df)[1]
-    if(is.numeric(df[[1]])) {
-      df <- df[df[[time_col_name]] <= max_day, ]
-    }
     
     times <- df[[1]]
     P <- as.matrix(df[, expected_cols])
     
-    cat("After filtering - times length:", length(times), "P dimensions:", dim(P), "\n")
+    cat("After processing - times length:", length(times), "P dimensions:", dim(P), "\n")
     
     P <- apply(P, 1, function(x) {
       x <- pmax(x, 0)
@@ -1333,11 +1559,11 @@ server <- function(input, output, session){
     }
     
     original_names <- names(df)
-    time_col <- original_names[1]  # First column should be timepoints
-    state_cols <- original_names[-1]  # Remaining columns are observed states
+    time_col <- original_names[1]  
+    state_cols <- original_names[-1]  
     
-    times <- df[[1]]  # Use first column directly
-    Theta <- as.matrix(df[, -1])  # Use all columns except first (timepoints)
+    times <- df[[1]]  
+    Theta <- as.matrix(df[, -1]) 
     
     cat("CC data - times length:", length(times), "Theta dimensions:", dim(Theta), "\n")
     
@@ -1381,7 +1607,7 @@ server <- function(input, output, session){
       }
       
       common_times <- as.character(sort(as.numeric(p_times)))
-      validate(need(length(common_times) >= 2, "Need at least two timepoints."))
+      shiny::validate(shiny::need(length(common_times) >= 2, "Need at least two timepoints."))
        
        P <- P[, common_times, drop = FALSE]
        Theta <- Theta[, common_times, drop = FALSE]
@@ -1445,6 +1671,92 @@ server <- function(input, output, session){
               class = "display compact hover")
   })
   
+  # Demo data loading functionality
+  demo_data <- reactiveValues(
+    b_matrix = NULL,
+    p0 = NULL,
+    theta = NULL,
+    loaded = FALSE
+  )
+  
+  observeEvent(input$loadDemo, {
+    req(input$demoCellLine)
+    
+    cell_line <- input$demoCellLine
+    treatment <- input$demoTreatment
+    
+    #Define file paths - try multiple locations
+    b_matrix_path <- paste0("extracted_matrices_and_data/b_matrices/", cell_line, "_TGFB_B_matrix.csv")
+    p0_path <- paste0("extracted_matrices_and_data/initial_emt_distributions/", cell_line, "_TGFB_initial_distribution.csv")
+    theta_path <- paste0("extracted_matrices_and_data/cell_cycle_data/", cell_line, "_", treatment, "_cell_cycle.csv")
+    
+    #If files not found in current directory, try www directory
+    if (!file.exists(b_matrix_path)) {
+      b_matrix_path <- paste0("www/extracted_matrices_and_data/b_matrices/", cell_line, "_TGFB_B_matrix.csv")
+      p0_path <- paste0("www/extracted_matrices_and_data/initial_emt_distributions/", cell_line, "_TGFB_initial_distribution.csv")
+      theta_path <- paste0("www/extracted_matrices_and_data/cell_cycle_data/", cell_line, "_", treatment, "_cell_cycle.csv")
+    }
+    
+    #Check if files exist
+    if (!file.exists(b_matrix_path) || !file.exists(p0_path) || !file.exists(theta_path)) {
+      showNotification("Demo files not found. Please ensure the extracted_matrices_and_data directory exists.", 
+                      type = "error", duration = 5)
+      return()
+    }
+    
+    #Load and set the data
+    tryCatch({
+     
+      b_data <- read.csv(b_matrix_path, check.names = FALSE)
+      
+      
+      p0_data <- read.csv(p0_path, check.names = FALSE)
+      
+     
+      theta_data <- read.csv(theta_path, check.names = FALSE)
+      
+      
+      demo_data$b_matrix <- b_data
+      demo_data$p0 <- p0_data
+      demo_data$theta <- theta_data
+      demo_data$loaded <- TRUE
+      
+      #Update observed state names from B matrix row names (first column contains row names)
+      if(ncol(b_data) >= 2 && !is.numeric(b_data[[1]])) {
+        obs_state_names <- b_data[[1]]
+        updateTextInput(session, "observedStateNames", 
+                       value = paste(obs_state_names, collapse = ","))
+      } else {
+        #If first column is numeric, assume no row names, use default
+        updateTextInput(session, "observedStateNames", 
+                       value = "S,G2M,G1")
+      }
+      
+      showNotification(paste("Demo data for", cell_line, "loaded successfully! (TGF-β for B/p0,", treatment, "for cell cycle)"), 
+                      type = "message", duration = 5)
+      
+    }, error = function(e) {
+      showNotification(paste("Error loading demo data:", e$message), 
+                      type = "error", duration = 5)
+    })
+  })
+  
+  #Clear demo data functionality
+  observeEvent(input$clearDemo, {
+    demo_data$b_matrix <- NULL
+    demo_data$p0 <- NULL
+    demo_data$theta <- NULL
+    demo_data$loaded <- FALSE
+    
+    #Reset dropdown
+    updateSelectInput(session, "demoCellLine", selected = "")
+    
+    #Reset observed state names
+    updateTextInput(session, "observedStateNames", value = "state1,state2,state3")
+    
+    showNotification("Demo data cleared!", type = "message", duration = 2)
+  })
+  
   fitting_results <- reactiveValues(data = NULL)
   
   observeEvent(input$runFit, {
@@ -1457,9 +1769,13 @@ server <- function(input, output, session){
           return(NULL)
         }
         cat("Validation passed, reading data...\n")
+       cat("Reading B matrix...\n")
        B <- rx_B()
+       cat("Reading p0...\n")
        p0 <- rx_p0()
+       cat("Reading Theta...\n")
        Theta <- rx_Theta()
+       cat("Reading times...\n")
        times <- rx_times()
        hidden_states <- rx_hidden_states()
        
@@ -1467,8 +1783,11 @@ server <- function(input, output, session){
        cat("B dimensions:", dim(B), "\n")
        cat("Theta dimensions:", dim(Theta), "\n")
        cat("Times:", times, "\n")
+       cat("p0:", p0, "\n")
        
+       cat("Matching timepoints...\n")
        Theta <- Theta[, match(times, as.numeric(colnames(Theta))), drop=FALSE]
+       cat("After matching - Theta dimensions:", dim(Theta), "\n")
        B <- proj_columns_simplex(B)
        
        showNotification("Fitting generator matrix...", duration = NULL, id = "fitting")

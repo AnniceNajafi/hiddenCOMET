@@ -71,44 +71,46 @@ check_matrix_conditioning <- function(G) {
 #' Constructs a generator matrix for a continuous-time Markov chain with linear topology
 #' (states connected sequentially: 1 <-> 2 <-> 3 <-> ... <-> n).
 #'
-#' @param eta Vector of unconstrained log-rate parameters (length = 2*(n-1))
+#' @param rates Vector of rate parameters (length = 2*(n-1))
 #' @param states Character vector of state names
 #' @return Generator matrix G with proper conditioning
 #' @examples
-#' eta <- log(c(0.1, 0.05, 0.2, 0.15))
+#' rates <- c(0.1, 0.05, 0.2, 0.15)
 #' states <- c("E", "H", "M")
-#' G <- build_G(eta, states)
+#' G <- build_G(rates, states)
 #' @details The generator matrix G satisfies:
 #' \itemize{
 #'   \item G[i,i] = -sum of off-diagonal elements in row i
 #'   \item G[i,j] >= 0 for i != j
 #'   \item Each row sums to zero
 #' }
+#' For 3 states (E, H, M), rates = c(muE, muM, lamE, lamM) where:
+#' muE = E → H, muM = M → H, lamE = H → E, lamM = H → M
 #' @export
-build_G <- function(eta, states){
+build_G <- function(rates, states){
   n <- length(states)
-  G <- matrix(0, n, n)
-  dimnames(G) <- list(states, states)
   
-  
-  if(n < 2) stop("Linear topology requires at least 2 states")
-  if(length(eta) != 2*(n-1)) stop("Linear topology requires 2*(n-1) parameters")
-  
-  k <- 1
-  for(i in 1:(n-1)){
-   
-    G[i, i+1] <- exp(eta[k])
-    G[i, i] <- G[i, i] - exp(eta[k])
-    k <- k + 1
-   
-    G[i+1, i] <- exp(eta[k])
-    G[i+1, i+1] <- G[i+1, i+1] - exp(eta[k])
-    k <- k + 1
+  if(n != 3 || !identical(states, c("E", "H", "M"))) {
+    stop("This function only works for 3 states: E, H, M")
+  }
+  if(length(rates) != 4) {
+    stop("Need exactly 4 rates: c(muE, muM, lamE, lamM)")
   }
   
-
+  # Direct parameterization matching the app:
+  # rates = c(muE, muM, lamE, lamM)
+  muE  <- rates[1]  # E → H
+  muM  <- rates[2]  # M → H  
+  lamE <- rates[3]  # H → E
+  lamM <- rates[4]  # H → M
+  
+  G <- rbind(c(-muE,         muE,           0),
+             c(lamE,  -(lamE+lamM),      lamM),
+             c(0,            muM,        -muM))
+  
+  rownames(G) <- colnames(G) <- c("E", "H", "M")
+  
   if(!check_matrix_conditioning(G)) {
-   
     diag(G) <- diag(G) - 1e-6
   }
   
@@ -118,27 +120,27 @@ build_G <- function(eta, states){
 #' Negative log-likelihood for CTMC model
 #'
 #' Computes the negative log-likelihood of observed data given fixed emission matrix B,
-#' initial distribution p0, and generator matrix parameters eta.
+#' initial distribution p0, and generator matrix rate parameters.
 #'
+#' @param rates Vector of generator matrix rate parameters (optimized by optim)
 #' @param theta_mat Observed state proportions matrix (n_obs × n_timepoints)
 #' @param B Emission matrix (n_obs × n_hidden)
 #' @param times Vector of timepoints
-#' @param eta Vector of generator matrix parameters
 #' @param p0 Initial hidden state distribution
 #' @param states Character vector of hidden state names
 #' @param N_pseudo Pseudo-count for multinomial likelihood (default: 3000)
 #' @return Negative log-likelihood value
 #' @examples
 #' # Example usage with sample data
+#' rates <- c(0.1, 0.05, 0.2, 0.15)
 #' theta_mat <- matrix(runif(12), 3, 4)
 #' B <- matrix(runif(9), 3, 3)
 #' times <- c(0, 1, 2, 3)
-#' eta <- log(c(0.1, 0.05, 0.2, 0.15))
 #' p0 <- c(0.8, 0.15, 0.05)
 #' states <- c("E", "H", "M")
-#' nll <- negloglik_G_p0fixed(theta_mat, B, times, eta, p0, states)
+#' nll <- negloglik_G_p0fixed(rates, theta_mat, B, times, p0, states)
 #' @export
-negloglik_G_p0fixed <- function(theta_mat, B, times, eta, p0, states, N_pseudo = 3000){
+negloglik_G_p0fixed <- function(rates, theta_mat, B, times, p0, states, N_pseudo = 3000){
   n_states <- length(states)
   #Normalize columns of Theta
   Theta <- apply(theta_mat, 2, function(x){
@@ -147,7 +149,7 @@ negloglik_G_p0fixed <- function(theta_mat, B, times, eta, p0, states, N_pseudo =
   })
   Y <- round(N_pseudo * Theta) # pseudo-counts
   
-  G <- build_G(eta, states)
+  G <- build_G(rates, states)
   t0 <- min(times)
   
  
@@ -178,7 +180,7 @@ negloglik_G_p0fixed <- function(theta_mat, B, times, eta, p0, states, N_pseudo =
 #' Fit generator matrix via multi-start optimization
 #'
 #' Estimates the generator matrix G using multi-start optimization with either
-#' Nelder-Mead or BFGS methods.
+#' Nelder-Mead or L-BFGS-B methods.
 #'
 #' @param Theta Observed state proportions matrix (n_obs × n_timepoints)
 #' @param B Emission matrix (n_obs × n_hidden)
@@ -187,13 +189,13 @@ negloglik_G_p0fixed <- function(theta_mat, B, times, eta, p0, states, N_pseudo =
 #' @param states Character vector of hidden state names
 #' @param starts Number of random restarts (default: 30)
 #' @param N_pseudo Pseudo-count for multinomial likelihood (default: 3000)
-#' @param method Optimization method: "Nelder-Mead" or "BFGS" (default: "Nelder-Mead")
+#' @param method Optimization method: "L-BFGS-B" (default: "L-BFGS-B")
 #' @return List containing:
 #' \itemize{
 #'   \item G: Estimated generator matrix
 #'   \item p0: Initial distribution (normalized)
 #'   \item P: Hidden state trajectory over time
-#'   \item par: Optimal parameters
+#'   \item par: Optimal rate parameters
 #'   \item value: Final negative log-likelihood value
 #' }
 #' @examples
@@ -205,50 +207,56 @@ negloglik_G_p0fixed <- function(theta_mat, B, times, eta, p0, states, N_pseudo =
 #' states <- c("E", "H", "M")
 #' result <- fit_G_given_p0(Theta, B, times, p0, states)
 #' @export
-fit_G_given_p0 <- function(Theta, B, times, p0, states, starts = 30, N_pseudo = 3000, method = "Nelder-Mead"){
+fit_G_given_p0 <- function(Theta, B, times, p0, states, starts = 30, N_pseudo = 3000, method = "L-BFGS-B"){
   p0 <- proj_simplex(as.numeric(p0))
   best <- list(value = Inf, par = NULL)
   
-  
   n <- length(states)
-  n_params <- 2 * (n - 1)  
+  n_params <- 2 * (n - 1)  # Linear topology: 2*(n-1) parameters
   
-  for(s in seq_len(starts)){
-    #More conservative parameter bounds to avoid numerical issues
-    if(method == "BFGS") {
-    
-      init <- log(runif(n_params, 0.05, 0.2))  
-      control_list <- list(maxit = 1000, reltol = 1e-6, abstol = 1e-6)
-    } else {
-     
-      init <- log(runif(n_params, 0.01, 0.3))
-      control_list <- list(maxit = 3000, reltol = 1e-8)
-    }
-    
-    fit  <- optim(
-      par = init,
-      fn  = negloglik_G_p0fixed,
-      method = method,
-      theta_mat = Theta, B = B, times = times, p0 = p0, states = states, N_pseudo = N_pseudo,
-      control = control_list
-    )
-    if(fit$value < best$value && fit$value < 1e5) best <- fit  # avoid failed optimizations
-  }
+        for(s in seq_len(starts)){
+          # Direct parameterization in rate space [0.01, 0.8]
+          init <- runif(n_params, 0.01, 0.8)
+          
+          fit  <- optim(
+            par = init,
+            fn  = negloglik_G_p0fixed,
+            method = "L-BFGS-B",
+            lower = rep(1e-5, n_params),
+            upper = rep(5, n_params),
+            theta_mat = Theta, B = B, times = times, p0 = p0, states = states, N_pseudo = N_pseudo,
+            control = list(maxit = 5000)
+          )
+          if(fit$value < best$value && fit$value < 1e5) best <- fit  # avoid failed optimizations
+        }
   G_hat <- build_G(best$par, states)
   
-  #Propagate p(t) with error handling
   t0 <- min(times)
   St <- lapply(times, function(tt) {
     tryCatch({
       expm::expm(t(G_hat) * (tt - t0))
     }, error = function(e) {
-      #If expm fails, return identity matrix
       diag(nrow(G_hat))
     })
   })
   P_hat <- sapply(St, function(S) as.numeric(S %*% p0))
-  P_hat <- apply(P_hat, 2, function(v){ v[v < 0] <- 0; v/sum(v) })
+  P_hat <- apply(P_hat, 2, function(v){ 
+    v[v < 0] <- 0
+    s <- sum(v)
+    if(s == 0 || is.na(s) || is.infinite(s)) {
+      cat("Warning: Trajectory sum is", s, "- using uniform distribution\n")
+      rep(1/length(v), length(v))  # If sum is 0 or invalid, use uniform distribution
+    } else {
+      v/s
+    }
+  })
   rownames(P_hat) <- states; colnames(P_hat) <- as.character(times)
+  
+  # Verify trajectories sum to 1
+  col_sums <- colSums(P_hat)
+  if(any(abs(col_sums - 1) > 1e-6)) {
+    cat("Warning: Some trajectory columns don't sum to 1:", col_sums, "\n")
+  }
   
   list(G = G_hat, p0 = p0, P = P_hat, par = best$par, value = best$value)
 }

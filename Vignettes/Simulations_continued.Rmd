@@ -11,6 +11,7 @@ As always, first load relevant libraries and set seed:
 library(tidyverse)
 library(expm)
 library(ggplot2)
+library(MASS)
 ```
 
 Set seed and similar functions as previous notebook:
@@ -27,9 +28,11 @@ proj_simplex <- function(v){
 proj_columns_simplex <- function(B){ for(j in 1:ncol(B)) B[,j] <- proj_simplex(B[,j]); B }
 
 
-build_G <- function(eta){  
-  muE  <- exp(eta[1]);  muM  <- exp(eta[2])
-  lamE <- exp(eta[3]);  lamM <- exp(eta[4])
+build_G <- function(rates){  
+  muE  <- rates[1]  # E → H
+  muM  <- rates[2]  # M → H
+  lamE <- rates[3]  # H → E
+  lamM <- rates[4]  # H → M
   rbind(c(-muE,   muE,        0),
         c(lamE, -(lamE+lamM), lamM),
         c(0,     muM,       -muM))
@@ -47,16 +50,22 @@ propagate_P <- function(G, times, p0){
 
 #Θ = B P  ⇒ LS estimate of B, then project columns to the simplex
 estimate_B_ls <- function(Theta, P){
-  B <- Theta %*% t(P) %*% solve(P %*% t(P))
+  ppt <- P %*% t(P)
+  # Use pseudoinverse if matrix is singular (more robust)
+  if(abs(det(ppt)) < 1e-10) {
+    B <- Theta %*% t(P) %*% MASS::ginv(ppt)
+  } else {
+    B <- Theta %*% t(P) %*% solve(ppt)
+  }
   proj_columns_simplex(B)
 }
 
 #Negative log-likelihood (uses Θ columns turned into pseudo-counts with N_pseudo)
-negloglik_G_p0fixed <- function(theta_mat, B, times, eta, p0, N_pseudo = 3000){
+negloglik_G_p0fixed <- function(rates, theta_mat, B, times, p0, N_pseudo = 3000){
   Theta <- apply(theta_mat, 2, function(x){ x <- pmax(x,0); s <- sum(x); if(s==0) rep(1/3,3) else x/s })
   Y <- round(N_pseudo * Theta)
   
-  G <- build_G(eta); t0 <- min(times)
+  G <- build_G(rates); t0 <- min(times)
   St <- lapply(times, function(tt) expm(t(G) * (tt - t0)))
   
   nll <- 0
@@ -74,8 +83,9 @@ fit_G_given_p0 <- function(Theta, B, times, p0, starts = 40, N_pseudo = 3000, se
   best <- list(value = Inf, par = rep(NA_real_, 4))
   for(s in 1:starts){
     set.seed(seed_base + s)
-    init <- log(runif(4, 0.02, 0.6))
-    fit  <- optim(init, negloglik_G_p0fixed, method = "Nelder-Mead",
+    init <- runif(4, 0.01, 0.8)  # Direct rates instead of log-rates
+    fit  <- optim(init, negloglik_G_p0fixed, method = "L-BFGS-B",
+                  lower = rep(1e-5, 4), upper = rep(5, 4),
                   theta_mat = Theta, B = B, times = times, p0 = p0, N_pseudo = N_pseudo,
                   control = list(maxit = 6000, reltol = 1e-10))
     if(fit$value < best$value) best <- fit
@@ -104,8 +114,8 @@ jitter_B_dirichlet <- function(B, sd = 0){
 times_num <- c(0, 1, 2, 3, 4, 5, 6)  
 p0_true   <- proj_simplex(c(0.85, 0.10, 0.05))
 
-eta_true <- log(c(muE=0.20, muM=0.18, lamE=0.25, lamM=0.22))
-G_true   <- build_G(eta_true)
+rates_true <- c(muE=0.20, muM=0.18, lamE=0.25, lamM=0.22)  # Direct rates
+G_true   <- build_G(rates_true)
 P_true   <- propagate_P(G_true, times_num, p0_true)
 
 B_true <- matrix(

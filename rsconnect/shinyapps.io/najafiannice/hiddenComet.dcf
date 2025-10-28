@@ -1,0 +1,13 @@
+name: hiddenComet
+title: hiddenComet
+username: najafiannice
+account: najafiannice
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 15813874
+bundleId: 11063019
+url: https://najafiannice.shinyapps.io/hiddenComet/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE
+ignoredFiles: DESCRIPTION|example_B_matrix.csv|example_observed_process.csv|example_p0_initial.csv|example_usage.R|hiddenCOMET_functions.R|NAMESPACE|README.md|sample_hidden_states_trajectory.csv|sample_observed_states_data.csv

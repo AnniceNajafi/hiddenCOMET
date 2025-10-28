@@ -1,0 +1,177 @@
+---
+title: "Figure 1A"
+output: html_notebook
+---
+
+The following notebook can be used to regenerate Figure 1A in the manuscript.
+
+
+As always, first load relevant libraries and set seed:
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(patchwork)  
+
+set.seed(1)
+```
+
+Define functions:
+
+```{r}
+rdirichlet1 <- function(alpha) { z <- rgamma(length(alpha), alpha, 1); z/sum(z) }
+```
+
+
+
+Project a vector to the probability simplex (Duchi et al., 2008)
+
+```{r}
+proj_simplex <- function(v){
+  u <- sort(v, decreasing = TRUE); sv <- cumsum(u)
+  rho <- max(which(u > (sv - 1) / seq_along(u)))
+  theta <- (sv[rho] - 1) / rho
+  pmax(v - theta, 0)
+}
+proj_cols_to_simplex <- function(M) apply(M, 2, proj_simplex)
+
+softmax_col <- function(Z){                      
+  eZ <- exp(Z - matrix(apply(Z, 2, max), nrow = nrow(Z), ncol = ncol(Z), byrow = TRUE))
+  sweep(eZ, 2, colSums(eZ), "/")
+}
+```
+
+Explained in the manuscript, here we set a single entry of a column-stochastic matrix, and renormalize other
+entries of that column proportionally so the column still sums to 1
+
+```{r}
+set_entry_and_renorm <- function(B, r, c, val){
+  stopifnot(val >= 0, val <= 1)
+  v <- B[, c]
+  v_rest <- v; v_rest[r] <- 0
+  if (sum(v_rest) == 0) v_rest[-r] <- 1 / (length(v) - 1)
+  rem <- 1 - val
+  v_new <- ifelse(seq_along(v) == r, val, rem * v_rest / sum(v_rest))
+  B2 <- B; B2[, c] <- v_new
+  B2
+}
+
+#closed-form LS (BX ≈ Θ):  B_hat = Θ X^T (X X^T)^(-1)
+closed_form_ls <- function(Theta, X){
+  XtX <- X %*% t(X)
+  Theta %*% t(X) %*% solve(XtX)
+}
+
+#negative log-likelihood for multinomial MLE with softmax parameterization
+nll_mn <- function(z_vec, X, Y_counts, eps = 1e-12){
+  C <- nrow(Y_counts); K <- nrow(X)
+  Z <- matrix(z_vec, nrow = C, ncol = K)
+  B <- softmax_col(Z)
+  P <- pmax(B %*% X, eps)
+  -sum(Y_counts * log(P))
+}
+```
+
+
+```{r}
+rows <- c("G1","S","G2M")
+cols <- c("E","H","M")
+
+B_base <- matrix(c(0.70, 0.20, 0.10,   
+                   0.30, 0.50, 0.20,  
+                   0.05, 0.25, 0.70), 
+                 nrow = 3, byrow = FALSE,
+                 dimnames = list(rows, cols))
+
+Tn <- 28                                        
+N_t <- sample(800:1500, Tn, replace = TRUE)      
+X <- sapply(1:Tn, function(i) rdirichlet1(c(3,3,3)))    
+rownames(X) <- cols; colnames(X) <- paste0("t", 1:Tn)
+
+
+grid_vals <- seq(0, 0.90, length.out = 18)  
+
+
+entry_tbl <- tribble(
+  ~r,   ~c,   ~label,
+  1L,   1L,  "Pr(G1|E)",
+  1L,   2L,  "Pr(G1|H)",
+  1L,   3L,  "Pr(G1|M)",
+  2L,   1L,  "Pr(S|E)",
+  2L,   2L,  "Pr(S|H)",
+  2L,   3L,  "Pr(S|M)",
+  3L,   1L,  "Pr(G2M|E)",
+  3L,   2L,  "Pr(G2M|H)",
+  3L,   3L,  "Pr(G2M|M)"
+)
+
+
+entry_order <- c("Pr(S|M)","Pr(S|H)","Pr(S|E)",
+                 "Pr(G2M|M)","Pr(G2M|H)","Pr(G2M|E)",
+                 "Pr(G1|M)","Pr(G1|H)","Pr(G1|E)")
+
+
+records <- list()
+
+for(i in seq_len(nrow(entry_tbl))){
+  r <- entry_tbl$r[i]; c <- entry_tbl$c[i]; lab <- entry_tbl$label[i]
+  
+  for (val in grid_vals){
+  
+    B_true <- set_entry_and_renorm(B_base, r, c, val)
+    
+
+    Theta_prob <- B_true %*% X
+    Y_counts <- sapply(1:Tn, function(t) rmultinom(1, size = N_t[t], prob = Theta_prob[, t]))
+    Y_frac   <- sweep(Y_counts, 2, colSums(Y_counts), "/")
+    
+ 
+    B_LS_unproj <- closed_form_ls(Y_frac, X)
+    B_LS <- proj_cols_to_simplex(B_LS_unproj)
+    
+
+    Z0 <- log(pmax(B_LS, 1e-6))                    
+    Z0 <- sweep(Z0, 2, colMeans(Z0), "-")          
+    opt <- optim(par = as.vector(Z0),
+                 fn  = nll_mn,
+                 X = X, Y_counts = Y_counts,
+                 method = "L-BFGS-B",
+                 control = list(maxit = 800))
+    B_MLE <- softmax_col(matrix(opt$par, nrow = 3, ncol = 3,
+                                dimnames = list(rows, cols)))
+    
+ 
+    records[[length(records)+1]] <- tibble(
+      entry = lab,
+      set_value = val,
+      est_ls  = B_LS[r, c],
+      est_mle = B_MLE[r, c],
+      true    = val         
+    )
+  }
+}
+
+df <- bind_rows(records) %>%
+  mutate(entry = factor(entry, levels = entry_order))
+
+
+mk_panel <- function(df, colname, title_txt){
+  ggplot(df, aes(x = set_value, y = entry, fill = .data[[colname]])) +
+    geom_tile() +
+    scale_x_continuous(expand = expansion(mult = 0.01)) +
+    scale_fill_gradient(limits = c(0,1), low = "#A376A2", high = "#19183B")+
+  
+    labs(title = title_txt, x = "Set value for that entry", y = NULL, fill = "Value") +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid = element_blank(),
+          plot.title = element_text(face = "bold", hjust = 0))
+}
+
+p_ls  <- mk_panel(df, "est_ls",  "LS estimate")
+p_mle <- mk_panel(df, "est_mle", "MLE estimate")
+p_tru <- mk_panel(df, "true",    "True value")
+
+
+p_ls + p_mle + p_tru
+```
+

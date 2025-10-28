@@ -1,0 +1,282 @@
+---
+title: "Figure 3"
+output: html_notebook
+---
+
+
+
+```{r}
+library(tidyverse)
+library(dtw)         
+library(reshape2)
+library(pheatmap)
+library(ggplot2)
+```
+
+
+```{r}
+files <- list(
+  TGFB = "C:/Users/annic/Downloads/TGFB_cell_cycle.csv",
+  TNF  = "C:/Users/annic/Downloads/TNF_cell_cycle.csv",
+  EGF  = "C:/Users/annic/Downloads/EGF_cell_cycle.csv"
+)
+
+cell_data <- imap_dfr(files, ~ {
+  df <- read.csv(.x, check.names = FALSE)
+  df$signal <- .y
+  df
+})
+
+
+cell_data <- cell_data %>%
+  filter(!is.na(time.points.j.), time.points.j. <= 7) %>%
+  transmute(
+    CellLine = data.input.CellLine,
+    Time     = as.numeric(time.points.j.),
+    G1       = as.numeric(g1_phase),
+    S        = as.numeric(s_phase),
+    G2M      = as.numeric(g2m_phase),
+    signal
+  ) %>%
+  group_by(CellLine, signal, Time) %>%
+  summarise(across(c(G1, S, G2M), mean, na.rm = TRUE), .groups = "drop")
+
+
+cell_data <- cell_data %>%
+  rowwise() %>%
+  mutate(total = sum(c(G1, S, G2M), na.rm = TRUE),
+         G1 = G1/total, S = S/total, G2M = G2M/total) %>%
+  ungroup() %>%
+  select(-total)
+
+
+trajectories <- cell_data %>%
+  group_split(CellLine, signal)
+
+
+get_traj <- function(df){
+  df <- df[order(df$Time), ]
+  as.numeric(c(df$G1, df$S, df$G2M))  
+}
+
+labels <- map_chr(trajectories, ~ paste(unique(.x$CellLine), unique(.x$signal), sep = "_"))
+traj_list <- map(trajectories, get_traj)
+
+
+n <- length(traj_list)
+dist_mat <- matrix(0, n, n, dimnames = list(labels, labels))
+
+for (i in seq_len(n)) {
+  for (j in seq_len(i-1)) {
+    dist_mat[i, j] <- dist_mat[j, i] <- dtw(traj_list[[i]], traj_list[[j]], distance.only = TRUE)$distance
+  }
+}
+
+
+hc <- hclust(as.dist(dist_mat), method = "complete")
+
+
+pheatmap(dist_mat,
+         clustering_distance_rows = as.dist(dist_mat),
+         clustering_distance_cols = as.dist(dist_mat),
+         clustering_method = "complete",
+         main = "DTW distances between cell-cycle trajectories (0–7 days)",
+         color = colorRampPalette(c("white","#d0d1e6","#756bb1","#54278f"))(100))
+```
+
+
+
+
+
+
+Figure 3B
+
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+})
+
+
+base_dir         <- "C:/Users/annic/Downloads"
+cc_path          <- file.path(base_dir, "TGFB_cell_cycle.csv")
+cell_lines       <- c("A549","DU145","MCF7","OVCA420")
+
+tmax_days        <- 7.0         
+align_method     <- "nearest"   
+nearest_tol_days <- 0.20        
+
+
+emt_keep_vars    <- c("Hybrid","Mesenchymal")  
+cc_keep_vars     <- c("S","G2M")               
+
+
+find_time_col <- function(nms){
+  cand <- c("time.points.j","time.points.j.","time_points_j","time")
+  m <- intersect(nms, cand)
+  if (!length(m)) stop("No time column found in CC file.")
+  m[1]
+}
+
+wide_emt <- function(df_emt){
+
+  w <- reshape(df_emt[, c("time","variable","value")],
+               timevar = "variable", idvar = "time", direction = "wide")
+  names(w) <- sub("^value\\.", "", names(w))
+  for (nm in c("Epithelial","Hybrid","Mesenchymal"))
+    if (!nm %in% names(w)) w[[nm]] <- NA_real_
+  w <- w[order(w$time), c("time","Epithelial","Hybrid","Mesenchymal")]
+  rownames(w) <- NULL
+  w
+}
+
+scale_df <- function(X) as.data.frame(scale(X, center = TRUE, scale = TRUE))
+
+nearest_match <- function(x_times, y_times, tol){
+  sapply(x_times, function(xi){
+    d <- abs(y_times - xi)
+    if (!length(d)) return(NA_integer_)
+    j <- which.min(d)
+    if (!length(j) || is.na(j) || d[j] > tol) NA_integer_ else j
+  })
+}
+
+linear_align_cc_to_emt <- function(emt_times, cc_df){
+  out <- data.frame(time = emt_times)
+  vars <- setdiff(names(cc_df), "time")
+  for (v in vars){
+    out[[v]] <- approx(cc_df$time, cc_df[[v]],
+                       xout = emt_times, method = "linear",
+                       rule = 1, ties = "ordered")$y
+  }
+  out
+}
+
+
+cc_raw <- read.csv(cc_path, stringsAsFactors = FALSE, check.names = FALSE)
+time_col <- find_time_col(names(cc_raw))
+req_cc <- c("data.input.CellLine", time_col, "s_phase","g1_phase","g2m_phase")
+if (!all(req_cc %in% names(cc_raw))) {
+  stop("Cell-cycle file missing columns: ",
+       paste(setdiff(req_cc, names(cc_raw)), collapse = ", "))
+}
+
+
+do_cca_for_cellline <- function(cl){
+  emt_path <- file.path(base_dir, sprintf("%s_TGFB_fractions.csv", cl))
+  if (!file.exists(emt_path)) {
+    warning(sprintf("[%s] EMT file not found at %s", cl, emt_path))
+    return(NULL)
+  }
+  emt_raw <- read.csv(emt_path, stringsAsFactors = FALSE, check.names = FALSE)
+  if (!all(c("time","variable","value") %in% names(emt_raw))) {
+    stop(sprintf("[%s] EMT file must have columns: time, variable, value", cl))
+  }
+  
+ 
+  emt_t <- subset(emt_raw, time <= tmax_days)
+  cc_t  <- subset(cc_raw, cc_raw[["data.input.CellLine"]] == cl &
+                    cc_raw[[time_col]] <= tmax_days)
+  if (nrow(emt_t) == 0 || nrow(cc_t) == 0) return(NULL)
+  
+ 
+  emt_w <- wide_emt(emt_t)
+  cc_w  <- cc_t[, c(time_col,"s_phase","g1_phase","g2m_phase")]
+  names(cc_w) <- c("time","S","G1","G2M")
+  cc_w <- cc_w[order(cc_w$time), ]
+  
+
+  if (align_method == "nearest"){
+    idx  <- nearest_match(emt_w$time, cc_w$time, tol = nearest_tol_days)
+    keep <- !is.na(idx)
+    if (sum(keep) < 3) return(NULL)
+    emt_a <- emt_w[keep, ]
+    cc_a  <- cc_w[idx[keep], ]
+  } else if (align_method == "linear"){
+    cc_interp <- linear_align_cc_to_emt(emt_w$time, cc_w)
+    keep <- complete.cases(cc_interp)
+    if (sum(keep) < 3) return(NULL)
+    emt_a <- emt_w[keep, ]
+    cc_a  <- cc_interp[keep, ]
+  } else stop("align_method must be 'nearest' or 'linear'.")
+  
+
+  if (!all(emt_keep_vars %in% names(emt_a))) return(NULL)
+  if (!all(cc_keep_vars  %in% names(cc_a)))  return(NULL)
+  
+  X <- scale_df(emt_a[, emt_keep_vars, drop = FALSE])  
+  Y <- scale_df(cc_a[,  cc_keep_vars,  drop = FALSE])  
+  n <- nrow(X); p <- ncol(X); q <- ncol(Y)
+  if (n <= max(p, q)) return(NULL)
+  
+  fit <- cancor(as.matrix(X), as.matrix(Y))
+  U <- as.matrix(X) %*% fit$xcoef
+  V <- as.matrix(Y) %*% fit$ycoef
+  r <- as.numeric(fit$cor)
+  
+  k <- min(2, length(r))
+  df <- lapply(seq_len(k), function(i){
+    data.frame(
+      cell_line = cl,
+      cv        = paste0("CV", i),
+      U         = U[, i],
+      V         = V[, i],
+      r         = r[i]
+    )
+  })
+  do.call(rbind, df)
+}
+
+
+scores_list <- lapply(cell_lines, do_cca_for_cellline)
+scores <- do.call(rbind, scores_list)
+if (is.null(scores) || !nrow(scores)) stop("No aligned data to plot.")
+scores$cv <- factor(scores$cv, levels = c("CV1","CV2"))
+
+
+r_labels <- scores %>%
+  group_by(cell_line, cv) %>%
+  summarise(r = unique(round(r, 2)), .groups = "drop") %>%
+  mutate(lbl = paste0("r = ", format(r, nsmall = 2)))
+
+
+facet_bar_pink <- "#547792" 
+accent_indigo  <- "#3D365C" 
+
+p <- ggplot(scores, aes(U, V)) +
+  geom_point(size = 3, shape = 8, stroke = 1.5, color = accent_indigo) +
+  geom_smooth(method = "lm", se = FALSE,
+              color = accent_indigo, linetype = "solid", linewidth = 1) +
+  facet_grid(rows = vars(cell_line), cols = vars(cv), scales = "free") +
+  geom_text(
+    data = r_labels,
+    aes(x = -Inf, y = Inf, label = lbl),
+    hjust = -0.15, vjust = 1.3,
+    color = accent_indigo, size = 4, fontface = "bold",
+    inherit.aes = FALSE
+  ) +
+  labs(
+    title    = "EMT vs Cell-cycle Canonical Variates (up to day 7)",
+    subtitle = "Each panel: EMT CV (x) vs Cell-cycle CV (y); line = OLS fit",
+    x = "EMT canonical variate",
+    y = "Cell-cycle canonical variate"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title      = element_text(face = "bold", color = accent_indigo, size = 15),
+    plot.subtitle   = element_text(color = accent_indigo, size = 11),
+    strip.text      = element_text(face = "bold", color = accent_indigo, size = 12),
+    strip.background= element_rect(fill = facet_bar_pink, color = NA),
+    panel.border    = element_rect(color = facet_bar_pink, fill = NA, linewidth = 0.6),
+    panel.grid.minor= element_blank(),
+    axis.text       = element_text(color = accent_indigo),
+    axis.title      = element_text(color = accent_indigo),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+print(p)
+
+```

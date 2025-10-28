@@ -1,0 +1,351 @@
+---
+title: "Figure 3"
+output: html_notebook
+---
+
+The following code generates heatmaps for the emission probabilities as shown in the manuscript
+
+
+Start by loading libraries:
+```{r}
+library(patchwork)
+library(tidyverse)
+```
+
+
+This is the LS case:
+
+```{r}
+clean_names_safe <- function(df) {
+  nm <- names(df); bad <- is.na(nm) | trimws(nm) == ""
+  if (any(bad)) nm[bad] <- paste0("col_", seq_len(sum(bad)))
+  names(df) <- make.names(nm, unique = TRUE)
+  df
+}
+
+proj_simplex <- function(v){
+  u <- sort(v, decreasing=TRUE); cssv <- cumsum(u)
+  rho <- max(which(u*seq_along(u) > (cssv-1)))
+  th  <- (cssv[rho]-1)/rho
+  w   <- pmax(v - th, 0); s <- sum(w)
+  if (s==0) w[] <- 1/length(w) else w <- w/s
+  w
+}
+proj_columns_simplex <- function(B){ for(j in seq_len(ncol(B))) B[,j] <- proj_simplex(B[,j]); B }
+
+estimate_B_ls <- function(Theta, P){
+  B <- Theta %*% t(P) %*% solve(P %*% t(P))
+  proj_columns_simplex(B)
+}
+
+
+pink_purple_strong <- c("#FCE4EC", "#F48FB1", "#CE5ABD", "#8E24AA", "#4A148C", "#1A0033")
+
+plot_B <- function(B, title = "") {
+  rn <- rownames(B); cn <- colnames(B)
+  if (!is.null(rn)) rn <- intersect(c("G1","S","G2M"), rn)
+  if (!is.null(cn)) cn <- intersect(c("E","H","M"), cn)
+  if (!is.null(rn) && length(rn)==3) B <- B[rn, , drop = FALSE]
+  if (!is.null(cn) && length(cn)==3) B <- B[, cn, drop = FALSE]
+  
+  as_tibble(B, rownames = "Cycle") |>
+    pivot_longer(-Cycle, names_to = "EMT", values_to = "prob") |>
+    ggplot(aes(x = EMT, y = Cycle, fill = prob)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = sprintf("%.2f", prob)), color = "white", size = 4) +
+    scale_fill_gradientn(
+      colors = pink_purple_strong,
+      limits = c(0, 1),
+      values = scales::rescale(c(0, 0.15, 0.35, 0.6, 0.85, 1)),
+      name = "Probability"
+    ) +
+    labs(title = title, x = "EMT state", y = "Cell-cycle stage") +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title   = element_text(face = "bold", hjust = 0.5),
+      legend.position = "bottom",
+      panel.grid   = element_blank()
+    )
+}
+
+emt_files <- c(
+  A549    = "C:\\Users\\annic\\Downloads\\A549_TGFB_fractions.csv",
+  DU145   = "C:\\Users\\annic\\Downloads\\DU145_TGFB_fractions.csv",
+  MCF7    = "C:\\Users\\annic\\Downloads\\MCF7_TGFB_fractions.csv",
+  OVCA420 = "C:\\Users\\annic\\Downloads\\OVCA420_TGFB_fractions.csv"
+)
+file_cc <- "C:\\Users\\annic\\Downloads\\TGFB_cell_cycle.csv"
+
+
+cc_raw <- read.csv(file_cc, check.names = FALSE) |> clean_names_safe()
+
+
+estimate_B_for_cellline <- function(cellline, emt_file, cc_raw, max_day = 7){
+  emt_raw <- read.csv(emt_file, check.names = FALSE) |> clean_names_safe()
+  
+  emt_tbl <- emt_raw |>
+    transmute(
+      time  = as.numeric(time),
+      state = case_when(
+        variable == "Epithelial"  ~ "E",
+        variable == "Hybrid"      ~ "H",
+        variable == "Mesenchymal" ~ "M",
+        TRUE ~ NA_character_
+      ),
+      value = as.numeric(value)
+    ) |>
+    filter(!is.na(state), !is.na(time), time <= max_day) |>
+    group_by(time, state) |>
+    summarise(frac = mean(value, na.rm = TRUE), .groups = "drop") |>
+    pivot_wider(names_from = time, values_from = frac) |>
+    arrange(match(state, c("E","H","M"))) |>
+    column_to_rownames("state")
+  
+  cc_tbl <- cc_raw |>
+    filter(data.input.CellLine == cellline) |>
+    transmute(
+      time = as.numeric(time.points.j.),
+      G1   = as.numeric(g1_phase),
+      S    = as.numeric(s_phase),
+      G2M  = as.numeric(g2m_phase)
+    ) |>
+    filter(!is.na(time), time <= max_day) |>
+    rowwise() |>
+    mutate(total = sum(c_across(G1:G2M), na.rm = TRUE),
+           G1 = ifelse(total > 0, G1/total, NA_real_),
+           S  = ifelse(total > 0, S/total,  NA_real_),
+           G2M= ifelse(total > 0, G2M/total,NA_real_)) |>
+    ungroup() |>
+    select(-total) |>
+    group_by(time) |>
+    summarise(across(everything(), ~mean(.x, na.rm = TRUE)), .groups = "drop") |>
+    pivot_longer(G1:G2M, names_to = "stage", values_to = "frac") |>
+    pivot_wider(names_from = time, values_from = frac) |>
+    arrange(match(stage, c("G1","S","G2M"))) |>
+    column_to_rownames("stage")
+  
+  common_times <- intersect(colnames(emt_tbl), colnames(cc_tbl))
+  common_times <- as.character(sort(as.numeric(common_times)))
+  if (length(common_times) < 2)
+    stop(paste("Not enough common timepoints ≤", max_day, "for", cellline))
+  
+  P     <- as.matrix(emt_tbl[, common_times, drop = FALSE])
+  Theta <- as.matrix(cc_tbl[,  common_times, drop = FALSE])
+  
+  P     <- apply(P, 2, function(x){ x <- pmax(x,0); s <- sum(x); if (s==0) rep(1/3,3) else x/s })
+  Theta <- apply(Theta, 2, function(x){ x <- pmax(x,0); s <- sum(x); if (s==0) rep(1/3,3) else x/s })
+  
+  B_hat <- estimate_B_ls(Theta, P)
+  dimnames(B_hat) <- list(c("G1","S","G2M"), c("E","H","M"))
+  list(B = B_hat, times = common_times)
+}
+
+
+results <- imap(emt_files, ~ estimate_B_for_cellline(.y, .x, cc_raw))
+B_list  <- lapply(results, `[[`, "B")
+
+
+for (nm in names(B_list)) {
+  cat("\n=== ", nm, " ===\n", sep = "")
+  print(round(B_list[[nm]], 4))
+}
+
+
+p1 <- plot_B(B_list[["A549"]],    "A549")
+p2 <- plot_B(B_list[["DU145"]],   "DU145")
+p3 <- plot_B(B_list[["MCF7"]],    "MCF7")
+p4 <- plot_B(B_list[["OVCA420"]], "OVCA420")
+
+grid <- (p1 + p2) / (p3 + p4)
+print(grid)
+```
+
+MLE case:
+
+```{r}
+
+clean_names_safe <- function(df) {
+  nm <- names(df); bad <- is.na(nm) | trimws(nm) == ""
+  if (any(bad)) nm[bad] <- paste0("col_", seq_len(sum(bad)))
+  names(df) <- make.names(nm, unique = TRUE)
+  df
+}
+
+softmax3 <- function(z) {
+  u <- exp(z - max(z))
+  u / sum(u)
+}
+
+
+decode_B <- function(par) {
+  B <- matrix(NA_real_, 3, 3)
+  for (j in 1:3) {
+    z <- par[(3*(j-1)+1):(3*j)]
+    B[, j] <- softmax3(z)
+  }
+  rownames(B) <- c("G1", "S", "G2M")
+  colnames(B) <- c("E", "H", "M")
+  B
+}
+
+
+estimate_B_mle <- function(Theta, P, N = 2000L, starts = 20L, method = "BFGS") {
+  stopifnot(all(dim(Theta) == dim(P)))
+  Tn <- ncol(Theta)
+  
+
+  Theta <- apply(Theta, 2, function(x){ x <- pmax(x,0); s <- sum(x); if (s==0) rep(1/3,3) else x/s })
+  P     <- apply(P,     2, function(x){ x <- pmax(x,0); s <- sum(x); if (s==0) rep(1/3,3) else x/s })
+  
+
+  if (length(N) == 1) N <- rep(N, Tn)
+  Y <- sweep(Theta, 2, N, `*`)  
+  
+
+  nll <- function(par) {
+    B <- decode_B(par)                     
+    Th_hat <- B %*% P                     
+    -sum(Y * log(pmax(Th_hat, 1e-12)))    
+  }
+  
+
+  best <- list(value = Inf, par = NULL)
+  for (s in seq_len(starts)) {
+    par0 <- rnorm(9, 0, 0.2)              
+    fit  <- optim(par0, nll, method = method,
+                  control = list(maxit = 2000, reltol = 1e-10))
+    if (fit$value < best$value) best <- fit
+  }
+  
+  decode_B(best$par)
+}
+
+
+pink_purple_strong <- c("#FCE4EC", "#F48FB1", "#CE5ABD", "#8E24AA", "#4A148C", "#1A0033")
+
+plot_B <- function(B, title = "") {
+  rn <- rownames(B); cn <- colnames(B)
+  if (!is.null(rn)) rn <- intersect(c("G1","S","G2M"), rn)
+  if (!is.null(cn)) cn <- intersect(c("E","H","M"), cn)
+  if (!is.null(rn) && length(rn)==3) B <- B[rn, , drop = FALSE]
+  if (!is.null(cn) && length(cn)==3) B <- B[, cn, drop = FALSE]
+  
+  as_tibble(B, rownames = "Cycle") |>
+    pivot_longer(-Cycle, names_to = "EMT", values_to = "prob") |>
+    ggplot(aes(x = EMT, y = Cycle, fill = prob)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = sprintf("%.2f", prob)), color = "white", size = 4) +
+    scale_fill_gradientn(
+      colors = pink_purple_strong,
+      limits = c(0, 1),
+      values = scales::rescale(c(0, 0.15, 0.35, 0.6, 0.85, 1)),
+      name = "Probability"
+    ) +
+    labs(title = title, x = "EMT state", y = "Cell-cycle stage") +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title   = element_text(face = "bold", hjust = 0.5),
+      legend.position = "bottom",
+      panel.grid   = element_blank()
+    )
+}
+
+
+emt_files <- c(
+  A549    = "C:\\Users\\annic\\Downloads\\A549_TGFB_fractions.csv",
+  DU145   = "C:\\Users\\annic\\Downloads\\DU145_TGFB_fractions.csv",
+  MCF7    = "C:\\Users\\annic\\Downloads\\MCF7_TGFB_fractions.csv",
+  OVCA420 = "C:\\Users\\annic\\Downloads\\OVCA420_TGFB_fractions.csv"
+)
+file_cc <- "C:\\Users\\annic\\Downloads\\TGFB_cell_cycle.csv"
+
+
+cc_raw <- read.csv(file_cc, check.names = FALSE) |> clean_names_safe()
+
+
+estimate_B_for_cellline <- function(cellline, emt_file, cc_raw, max_day = 7, N_pseudo = 2000L){
+  emt_raw <- read.csv(emt_file, check.names = FALSE) |> clean_names_safe()
+  
+
+  emt_tbl <- emt_raw |>
+    transmute(
+      time  = as.numeric(time),
+      state = case_when(
+        variable == "Epithelial"  ~ "E",
+        variable == "Hybrid"      ~ "H",
+        variable == "Mesenchymal" ~ "M",
+        TRUE ~ NA_character_
+      ),
+      value = as.numeric(value)
+    ) |>
+    filter(!is.na(state), !is.na(time), time <= max_day) |>
+    group_by(time, state) |>
+    summarise(frac = mean(value, na.rm = TRUE), .groups = "drop") |>
+    pivot_wider(names_from = time, values_from = frac) |>
+    arrange(match(state, c("E","H","M"))) |>
+    column_to_rownames("state")
+  
+  cc_tbl <- cc_raw |>
+    filter(data.input.CellLine == cellline) |>
+    transmute(
+      time = as.numeric(time.points.j.),
+      G1   = as.numeric(g1_phase),
+      S    = as.numeric(s_phase),
+      G2M  = as.numeric(g2m_phase)
+    ) |>
+    filter(!is.na(time), time <= max_day) |>
+    rowwise() |>
+    mutate(total = sum(c_across(G1:G2M), na.rm = TRUE),
+           G1 = ifelse(total > 0, G1/total, NA_real_),
+           S  = ifelse(total > 0, S/total,  NA_real_),
+           G2M= ifelse(total > 0, G2M/total,NA_real_)) |>
+    ungroup() |>
+    select(-total) |>
+    group_by(time) |>
+    summarise(across(everything(), ~mean(.x, na.rm = TRUE)), .groups = "drop") |>
+    pivot_longer(G1:G2M, names_to = "stage", values_to = "frac") |>
+    pivot_wider(names_from = time, values_from = frac) |>
+    arrange(match(stage, c("G1","S","G2M"))) |>
+    column_to_rownames("stage")
+  
+
+  common_times <- intersect(colnames(emt_tbl), colnames(cc_tbl))
+  common_times <- as.character(sort(as.numeric(common_times)))
+  if (length(common_times) < 2)
+    stop(paste("Not enough common timepoints ≤", max_day, "for", cellline))
+  
+  P     <- as.matrix(emt_tbl[, common_times, drop = FALSE])
+  Theta <- as.matrix(cc_tbl[,  common_times, drop = FALSE])
+  
+
+  B_hat <- estimate_B_mle(Theta, P, N = N_pseudo, starts = 25L, method = "BFGS")
+  dimnames(B_hat) <- list(c("G1","S","G2M"), c("E","H","M"))
+  list(B = B_hat, times = common_times)
+}
+
+
+results <- purrr::imap(emt_files, ~ estimate_B_for_cellline(.y, .x, cc_raw))
+B_list  <- lapply(results, `[[`, "B")
+
+
+for (nm in names(B_list)) {
+  cat("\n=== ", nm, " (MLE) ===\n", sep = "")
+  print(round(B_list[[nm]], 4))
+}
+
+
+p1 <- plot_B(B_list[["A549"]],    "A549")
+p2 <- plot_B(B_list[["DU145"]],   "DU145")
+p3 <- plot_B(B_list[["MCF7"]],    "MCF7")
+p4 <- plot_B(B_list[["OVCA420"]], "OVCA420")
+
+grid <- (p1 + p2) / (p3 + p4)
+print(grid)
+
+```
+
+
+
+
+
+

@@ -1,0 +1,292 @@
+---
+title: "Figure 1B"
+output: html_notebook
+---
+The following notebook can be used to regenerate Figure 1B in the manuscript.
+
+
+As always, first load relevant libraries and set seed:
+
+```{r}
+library(tidyverse)
+library(expm)
+library(ggplot2)
+```
+
+Set seed and similar functions as previous notebook:
+```{r}
+set.seed(42)
+
+
+proj_simplex <- function(v){
+  u <- sort(v, decreasing = TRUE); cssv <- cumsum(u)
+  rho <- max(which(u * seq_along(u) > (cssv - 1)))
+  th  <- (cssv[rho] - 1) / rho
+  w   <- pmax(v - th, 0); s <- sum(w); if(s==0) w[] <- 1/length(w) else w <- w/s; w
+}
+proj_columns_simplex <- function(B){ for(j in 1:ncol(B)) B[,j] <- proj_simplex(B[,j]); B }
+
+
+build_G <- function(eta){  
+  muE  <- exp(eta[1]);  muM  <- exp(eta[2])
+  lamE <- exp(eta[3]);  lamM <- exp(eta[4])
+  rbind(c(-muE,   muE,        0),
+        c(lamE, -(lamE+lamM), lamM),
+        c(0,     muM,       -muM))
+}
+
+
+propagate_P <- function(G, times, p0){
+  t0 <- min(times)
+  St <- lapply(times, function(tt) expm(t(G) * (tt - t0)))
+  P  <- sapply(St, function(S) as.numeric(S %*% p0))
+  P  <- apply(P, 2, function(v){ v[v<0] <- 0; v/sum(v) })
+  rownames(P) <- c("E","H","M"); colnames(P) <- as.character(times)
+  P
+}
+
+#Θ = B P  ⇒ LS estimate of B, then project columns to the simplex
+estimate_B_ls <- function(Theta, P){
+  B <- Theta %*% t(P) %*% solve(P %*% t(P))
+  proj_columns_simplex(B)
+}
+
+#Negative log-likelihood (uses Θ columns turned into pseudo-counts with N_pseudo)
+negloglik_G_p0fixed <- function(theta_mat, B, times, eta, p0, N_pseudo = 3000){
+  Theta <- apply(theta_mat, 2, function(x){ x <- pmax(x,0); s <- sum(x); if(s==0) rep(1/3,3) else x/s })
+  Y <- round(N_pseudo * Theta)
+  
+  G <- build_G(eta); t0 <- min(times)
+  St <- lapply(times, function(tt) expm(t(G) * (tt - t0)))
+  
+  nll <- 0
+  for(i in seq_along(times)){
+    pt <- St[[i]] %*% p0
+    th <- pmax(B %*% pt, 1e-12)
+    nll <- nll - sum(Y[,i] * log(th))
+  }
+  nll
+}
+
+#Fit G (only) with p0 fixed, multi-start
+fit_G_given_p0 <- function(Theta, B, times, p0, starts = 40, N_pseudo = 3000, seed_base = 1L){
+  p0 <- proj_simplex(p0)
+  best <- list(value = Inf, par = rep(NA_real_, 4))
+  for(s in 1:starts){
+    set.seed(seed_base + s)
+    init <- log(runif(4, 0.02, 0.6))
+    fit  <- optim(init, negloglik_G_p0fixed, method = "Nelder-Mead",
+                  theta_mat = Theta, B = B, times = times, p0 = p0, N_pseudo = N_pseudo,
+                  control = list(maxit = 6000, reltol = 1e-10))
+    if(fit$value < best$value) best <- fit
+  }
+  G_hat <- build_G(best$par)
+  P_hat <- propagate_P(G_hat, times, p0)
+  list(G = G_hat, par = best$par, value = best$value, P = P_hat)
+}
+
+#Utility: column-wise Dirichlet jitter for B (induces model mismatch)
+jitter_B_dirichlet <- function(B, sd = 0){
+  if(sd <= 0) return(B)
+  out <- B
+  for(j in seq_len(ncol(B))){
+    alpha <- pmax(B[,j], 1e-6) / sd^2  #heuristic to set concentration ~ 1/sd^2
+    draw <- rgamma(length(alpha), shape = pmax(alpha, 1e-3), rate = 1)
+    out[,j] <- proj_simplex(draw)
+  }
+  proj_columns_simplex(out)
+}
+```
+
+
+
+```{r}
+times_num <- c(0, 1, 2, 3, 4, 5, 6)  
+p0_true   <- proj_simplex(c(0.85, 0.10, 0.05))
+
+eta_true <- log(c(muE=0.20, muM=0.18, lamE=0.25, lamM=0.22))
+G_true   <- build_G(eta_true)
+P_true   <- propagate_P(G_true, times_num, p0_true)
+
+B_true <- matrix(
+  c(0.80, 0.15, 0.05,   
+    0.15, 0.70, 0.25,   
+    0.05, 0.15, 0.70),  
+  nrow = 3, byrow = TRUE,
+  dimnames = list(c("G1","S","G2M"), c("E","H","M"))
+)
+B_true <- proj_columns_simplex(B_true)
+
+
+grid <- expand.grid(
+  N_counts   = c(500, 1000, 3000, 10000),
+  B_noise_sd = c(0.00, 0.05, 0.10),
+  stringsAsFactors = FALSE
+)
+
+REPLICATES <- 20        
+STARTS     <- 40       
+N_PSEUDO   <- 3000      
+
+results <- vector("list", nrow(grid) * REPLICATES)
+row_id  <- 0
+
+for (g in seq_len(nrow(grid))){
+  N_counts   <- grid$N_counts[g]
+  B_noise_sd <- grid$B_noise_sd[g]
+  
+  for (r in 1:REPLICATES){
+    row_id <- row_id + 1
+    #Generate a mismatched B* for data generation (sd coresponding to jitter)
+    B_gen <- jitter_B_dirichlet(B_true, sd = B_noise_sd)
+    
+    #Generate Θ_true = B_gen %*% P_true
+    Theta_true <- B_gen %*% P_true
+    Theta_true <- apply(Theta_true, 2, function(x) x / sum(x))
+    
+    #Sample multinomial counts => noisy Θ_obs
+    counts <- sapply(seq_len(ncol(Theta_true)), function(j){
+      prob <- pmax(Theta_true[,j], 0); prob <- prob / sum(prob)
+      as.vector(rmultinom(1, size = N_counts, prob = prob))
+    })
+    Theta_obs <- sweep(counts, 2, colSums(counts), "/")
+    Theta_obs[!is.finite(Theta_obs)] <- 1/3
+    rownames(Theta_obs) <- rownames(B_true); colnames(Theta_obs) <- colnames(P_true)
+    
+    #Simulate "observed EMT" to compare against (here we add a light Dirichlet noise to P_true)
+    P_obs <- P_true
+
+    # P_obs <- apply(P_true, 2, function(p) proj_simplex(p + rnorm(3,0,0.01)))
+    
+    #Estimate B via LS from (Theta_obs, P_obs) 
+    B_hat <- estimate_B_ls(Theta_obs, P_obs)
+    
+    #Fix p0 from earliest EMT (from true P here; you can also use P_obs[,1])
+    p0_fit <- P_obs[, which.min(times_num)]
+    
+    #Fit G (multi-start)
+    seed_base <- 100000*g + r
+    fit <- fit_G_given_p0(Theta = Theta_obs, B = B_hat, times = times_num,
+                          p0 = p0_fit, starts = STARTS, N_pseudo = N_PSEUDO,
+                          seed_base = seed_base)
+    P_hat <- fit$P
+    
+
+    rmse_true <- sqrt(mean((as.vector(P_hat) - as.vector(P_true))^2))
+    rmse_obs  <- sqrt(mean((as.vector(P_hat) - as.vector(P_obs))^2))
+    
+
+    rmse_true_by_state <- sqrt(rowMeans((P_hat - P_true)^2))
+    
+    results[[row_id]] <- list(
+      N_counts   = N_counts,
+      B_noise_sd = B_noise_sd,
+      replicate  = r,
+      nll        = fit$value,
+      rmse_true  = rmse_true,
+      rmse_obs   = rmse_obs,
+      rmse_true_E = rmse_true_by_state["E"],
+      rmse_true_H = rmse_true_by_state["H"],
+      rmse_true_M = rmse_true_by_state["M"]
+    )
+    if (r %% 5 == 0) cat(sprintf("[grid %d/%d] N=%d, sd=%.2f, rep=%d done\n",
+                                 g, nrow(grid), N_counts, B_noise_sd, r))
+  }
+}
+
+df_res <- bind_rows(results)
+
+
+df_sum <- df_res %>%
+  group_by(N_counts, B_noise_sd) %>%
+  summarise(
+    reps       = n(),
+    RMSE_true_mean = mean(rmse_true),
+    RMSE_true_sd   = sd(rmse_true),
+    RMSE_obs_mean  = mean(rmse_obs),
+    RMSE_obs_sd    = sd(rmse_obs),
+    E_mean = mean(rmse_true_E), H_mean = mean(rmse_true_H), M_mean = mean(rmse_true_M),
+    .groups = "drop"
+  )
+
+print(df_sum)
+
+
+p1 <- df_res %>%
+  mutate(N_counts = factor(N_counts)) %>%
+  ggplot(aes(x = N_counts, y = rmse_true)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.4) +
+  geom_jitter(width = 0.15, height = 0, size = 1, alpha = 0.5) +
+  facet_wrap(~ B_noise_sd, labeller = label_bquote(sd == .(B_noise_sd))) +
+  labs(title = "RMSE vs TRUE hidden EMT: effect of sampling depth and B mismatch",
+       x = "Multinomial sample size per time point (N_counts)",
+       y = "RMSE (P_hat vs P_true)") +
+  theme_minimal(base_size = 14)
+
+
+p2 <- df_res %>%
+  mutate(N_counts = factor(N_counts)) %>%
+  ggplot(aes(x = N_counts, y = rmse_obs)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.4) +
+  geom_jitter(width = 0.15, height = 0, size = 1, alpha = 0.5) +
+  facet_wrap(~ B_noise_sd, labeller = label_bquote(sd == .(B_noise_sd))) +
+  labs(title = "RMSE vs OBSERVED EMT: effect of sampling depth and B mismatch",
+       x = "Multinomial sample size per time point (N_counts)",
+       y = "RMSE (P_hat vs P_obs)") +
+  theme_minimal(base_size = 14)
+
+```
+
+```{r}
+df_long_state <- df_res %>%
+  dplyr::select(N_counts, B_noise_sd, replicate, tidyselect::starts_with("rmse_true_")) %>%
+  tidyr::pivot_longer(cols = tidyselect::starts_with("rmse_true_"),
+                      names_to = "state", values_to = "rmse") %>%
+  dplyr::mutate(state = dplyr::recode(state,
+                                      rmse_true_E = "E",
+                                      rmse_true_H = "H",
+                                      rmse_true_M = "M"))
+
+
+
+p3 <- df_long_state %>%
+  mutate(N_counts = factor(N_counts)) %>%
+  ggplot(aes(x = N_counts, y = rmse, color = state, group = interaction(state, N_counts))) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.35, color = "gray30") +
+  geom_jitter(width = 0.15, height = 0, size = 0.9, alpha = 0.6) +
+  facet_wrap(~ B_noise_sd, labeller = label_bquote(sd == .(B_noise_sd))) +
+  scale_color_manual(values = c(E = '#BEAEE2', H = '#F7DBF0', M = '#CDF0EA')) +
+  labs(title = "Per-state RMSE against true EMT trajectory values",
+       x = "N counts", y = "RMSE", color = "State") +
+  theme_minimal(base_size = 14)+
+  theme(
+    # Remove panel border
+    panel.border=element_blank(),  
+    #plot.border = element_blank(),
+    # Remove panel grid lines
+    panel.background = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    # Add axis line
+    axis.line = element_line(colour = "black"),
+    #legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size=20),
+    axis.text = element_text(size = 15),
+    text = element_text(size=18)
+  )
+
+
+print(p3)
+```
+
+
+
+
+
+
+
+
+
+
+
+

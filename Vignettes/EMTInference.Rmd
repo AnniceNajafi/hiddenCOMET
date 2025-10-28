@@ -1,0 +1,619 @@
+---
+title: "Figure 6 and 7"
+output: html_notebook
+---
+
+```{r}
+
+library(tidyverse)
+library(expm)   
+library(rlang)   
+
+
+set.seed(1234)
+
+
+cell_line  <- "OVCA420"
+conditions <- c("TGFB","EGF","TNF")
+
+file_emt <- sprintf("C:\\Users\\annic\\Downloads\\%s_TGFB_fractions.csv", cell_line)
+file_cc  <- function(cond) sprintf("C:\\Users\\annic\\Downloads\\%s_cell_cycle.csv", cond)
+
+
+clean_names_safe <- function(df){
+  nm <- names(df); bad <- is.na(nm) | trimws(nm) == ""
+  if (any(bad)) nm[bad] <- paste0("col_", seq_len(sum(bad)))
+  names(df) <- make.names(nm, unique = TRUE)
+  df
+}
+
+pick_col <- function(df, candidates, allow_partial = TRUE){
+  nm  <- names(df); nml <- tolower(nm)
+  for (cand in candidates){
+    cl <- tolower(cand)
+    i <- which(nml == cl)                  # exact
+    if (length(i) > 0) return(nm[i[1]])
+    if (allow_partial){
+      i <- which(grepl(cl, nml, fixed = TRUE))  # contains
+      if (length(i) > 0) return(nm[i[1]])
+    }
+  }
+  NA_character_
+}
+
+normalize_cols_to_2dp <- function(M){
+  if (is.null(colnames(M))) return(M)
+  cn <- suppressWarnings(as.numeric(colnames(M)))
+  if (all(is.finite(cn))) colnames(M) <- format(round(cn, 2), nsmall = 2)
+  M
+}
+
+
+proj_simplex <- function(v){
+  u <- sort(v, decreasing = TRUE); cssv <- cumsum(u)
+  rho <- max(which(u * seq_along(u) > (cssv - 1)))
+  th  <- (cssv[rho] - 1) / rho
+  w   <- pmax(v - th, 0); s <- sum(w)
+  if (s == 0) w[] <- 1/length(w) else w <- w/s
+  w
+}
+proj_columns_simplex <- function(B){ for(j in 1:ncol(B)) B[,j] <- proj_simplex(B[,j]); B }
+
+
+estimate_B_ls <- function(Theta, P, ridge = 1e-8){
+  K <- P %*% t(P) + diag(ridge, nrow(P))
+  B <- Theta %*% t(P) %*% solve(K)
+  proj_columns_simplex(B)
+}
+
+
+build_G_from_rates <- function(r){  
+  muE  <- r[1]; muM  <- r[2]; lamE <- r[3]; lamM <- r[4]
+  G <- rbind(c(-muE,   muE,        0),
+             c(lamE, -(lamE+lamM), lamM),
+             c(0,     muM,       -muM))
+  rownames(G) <- colnames(G) <- c("E","H","M")
+  G
+}
+
+safe_expm <- function(M){
+  if (!all(is.finite(M))) return(NULL)
+  tryCatch(expm(M), error = function(e) NULL)
+}
+
+
+negloglik_G_p0fixed <- function(theta_mat, B, times, rates, p0, N_pseudo = 3000){
+  Theta <- apply(theta_mat, 2, function(x){ x <- pmax(x,0); s <- sum(x); if (s==0) rep(1/3,3) else x/s })
+  Y <- round(N_pseudo * Theta)
+  G <- build_G_from_rates(rates)
+  if (!all(is.finite(G))) return(1e50)
+  t0 <- min(times); nll <- 0
+  for (i in seq_along(times)){
+    S <- safe_expm(t(G) * (times[i] - t0)); if (is.null(S)) return(1e50)
+    pt <- S %*% p0
+    th <- pmax(B %*% pt, 1e-12)
+    nll <- nll - sum(Y[, i] * log(th))
+  }
+  as.numeric(nll)
+}
+
+fit_G_given_p0 <- function(Theta, B, times, p0, starts = 30, N_pseudo = 3000){
+  p0 <- proj_simplex(p0); best <- list(value = Inf)
+  for (s in 1:starts){
+    init <- runif(4, 0.01, 0.8)
+    fit  <- optim(init, negloglik_G_p0fixed, method = "L-BFGS-B",
+                  lower = rep(1e-5, 4), upper = rep(5, 4),
+                  theta_mat = Theta, B = B, times = times, p0 = p0, N_pseudo = N_pseudo,
+                  control = list(maxit = 5000))
+    if (fit$value < best$value) best <- fit
+  }
+  build_G_from_rates(best$par)
+}
+
+tidy_G_rates <- function(G, condition){
+  tibble(
+    condition  = condition,
+    transition = c("E→H","H→E","H→M","M→H"),
+    rate       = c(G["E","H"], G["H","E"], G["H","M"], G["M","H"])
+  )
+}
+
+
+build_theta_from_cc <- function(cc_df, cell_line){
+  df <- clean_names_safe(cc_df)
+
+  if (any(is.na(names(df)) | names(df) == "")) {
+    bad <- is.na(names(df)) | names(df) == ""
+    names(df)[bad] <- paste0("col_", seq_len(sum(bad)))
+  }
+  df <- df[, colSums(!is.na(df)) > 0, drop = FALSE]
+  
+  cl_col   <- pick_col(df, c("data.input.CellLine","CellLine","cell_line","cellline","line"))
+  time_col <- pick_col(df, c("time.points.j.","time","hours","hour","day","days"))
+  g1_col   <- pick_col(df, c("g1_phase","G1","G1.phase"))
+  s_col    <- pick_col(df, c("s_phase","S","S.phase"))
+  g2m_col  <- pick_col(df, c("g2m_phase","g2m","G2M","G2M.phase"))
+  
+  if (is.na(time_col) || anyNA(c(g1_col, s_col, g2m_col))) return(NULL)
+  
+  df <- if (!is.na(cl_col)) {
+    dplyr::filter(df, tolower(trimws(.data[[cl_col]])) == tolower(trimws(cell_line)))
+  } else df
+  if (nrow(df) == 0) return(NULL)
+  
+  Theta_full <- df |>
+    transmute(
+      time = suppressWarnings(as.numeric(.data[[time_col]])),
+      G1   = suppressWarnings(as.numeric(.data[[g1_col]])),
+      S    = suppressWarnings(as.numeric(.data[[s_col]])),
+      G2M  = suppressWarnings(as.numeric(.data[[g2m_col]]))
+    ) |>
+    filter(!is.na(time), time <= 7) |>
+    group_by(time) |>
+    summarise(across(c(G1,S,G2M), ~mean(.x, na.rm = TRUE)), .groups = "drop") |>
+
+    rowwise() |>
+    mutate(total = sum(c_across(G1:G2M), na.rm = TRUE),
+           G1 = ifelse(total>0, G1/total, NA_real_),
+           S  = ifelse(total>0, S/total,  NA_real_),
+           G2M= ifelse(total>0, G2M/total,NA_real_)) |>
+    ungroup() |>
+    pivot_longer(G1:G2M, names_to = "stage", values_to = "frac") |>
+    mutate(stage = trimws(stage)) |>
+    group_by(stage, time) |>
+    summarise(frac = mean(frac, na.rm = TRUE), .groups = "drop") |>
+    filter(stage %in% c("G1","S","G2M")) |>
+    pivot_wider(names_from = time, values_from = frac) |>
+    group_by(stage) |>
+    summarise(across(everything(), ~mean(.x, na.rm = TRUE)), .groups = "drop") |>
+    arrange(match(stage, c("G1","S","G2M"))) |>
+    distinct(stage, .keep_all = TRUE)
+  
+  stopifnot(!any(duplicated(Theta_full$stage)))
+  
+  Theta_full <- Theta_full |>
+    column_to_rownames("stage") |>
+    as.matrix()
+  
+  normalize_cols_to_2dp(Theta_full)
+}
+
+
+predict_cell_cycle <- function(B, G, times, p0){
+  t0 <- min(times)
+  Th <- matrix(NA_real_, nrow = 3, ncol = length(times),
+               dimnames = list(rownames(B), as.character(times)))
+  for (i in seq_along(times)){
+    S  <- safe_expm(t(G) * (times[i] - t0))
+    pt <- S %*% p0
+    th <- pmax(B %*% pt, 0)
+    s  <- sum(th); Th[, i] <- if (s > 0) th / s else rep(1/3, 3)
+  }
+  Th
+}
+
+
+stopifnot(file.exists(file_emt))
+emt_raw <- read.csv(file_emt, check.names = FALSE) |> clean_names_safe()
+
+emt_time_col <- pick_col(emt_raw, c("^time$","time"))
+emt_state_col<- pick_col(emt_raw, c("variable","state","State"))
+emt_val_col  <- pick_col(emt_raw, c("value","frac","fraction","proportion"))
+stopifnot(!is.na(emt_time_col), !is.na(emt_state_col), !is.na(emt_val_col))
+
+P_full <- emt_raw |>
+  transmute(
+    time  = as.numeric(.data[[emt_time_col]]),
+    state = case_when(
+      .data[[emt_state_col]] == "Epithelial"  ~ "E",
+      .data[[emt_state_col]] == "Hybrid"      ~ "H",
+      .data[[emt_state_col]] == "Mesenchymal" ~ "M",
+      TRUE ~ NA_character_
+    ),
+    value = as.numeric(.data[[emt_val_col]])
+  ) |>
+  filter(!is.na(state), !is.na(time), time <= 7) |>
+  group_by(time, state) |>
+  summarise(frac = mean(value, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = time, values_from = frac) |>
+  arrange(match(state, c("E","H","M"))) |>
+  column_to_rownames("state") |>
+  as.matrix()
+
+P_full <- normalize_cols_to_2dp(P_full)
+
+
+Theta_by_cond <- list()
+for (cond in conditions) {
+  path <- file_cc(cond)
+  if (!file.exists(path)) { warning(sprintf("[%s] missing: %s", cond, path)); next }
+  cc_raw <- read.csv(path, check.names = FALSE)
+  Theta_by_cond[[cond]] <- build_theta_from_cc(cc_raw, cell_line)
+}
+Theta_by_cond <- Theta_by_cond[!vapply(Theta_by_cond, is.null, logical(1))]
+stopifnot("TGFB" %in% names(Theta_by_cond))
+
+
+common_tgfb_keys <- intersect(colnames(P_full), colnames(Theta_by_cond$TGFB))
+stopifnot(length(common_tgfb_keys) >= 2)
+
+P_train   <- apply(P_full[ ,     common_tgfb_keys, drop=FALSE], 2, function(x){ x <- pmax(x,0); s <- sum(x); if(s==0) rep(1/3,3) else x/s })
+Theta_trn <- apply(Theta_by_cond$TGFB[, common_tgfb_keys, drop=FALSE], 2, function(x){ x <- pmax(x,0); s <- sum(x); if(s==0) rep(1/3,3) else x/s })
+
+B_tgfb <- estimate_B_ls(Theta_trn, P_train)
+times_tgfb <- as.numeric(common_tgfb_keys)
+p0     <- proj_simplex(P_train[, which.min(times_tgfb)])  
+
+
+fits <- list()
+rates_list <- list()
+
+for (cond in conditions) {
+  if (!cond %in% names(Theta_by_cond)) { warning(sprintf("[%s] Θ missing; skip", cond)); next }
+  Theta_full <- Theta_by_cond[[cond]]
+  
+  common_keys <- intersect(colnames(P_full), colnames(Theta_full))
+  if (length(common_keys) < 2) { warning(sprintf("[%s] not enough common timepoints; skip", cond)); next }
+  
+  P_use     <- apply(P_full[,     common_keys, drop=FALSE], 2, function(x){ x <- pmax(x,0); s <- sum(x); if(s==0) rep(1/3,3) else x/s })
+  Theta_use <- apply(Theta_full[, common_keys, drop=FALSE], 2, function(x){ x <- pmax(x,0); s <- sum(x); if(s==0) rep(1/3,3) else x/s })
+  times_num <- as.numeric(common_keys)
+  
+  G_hat <- fit_G_given_p0(Theta_use, B_tgfb, times_num, p0)
+  
+  fits[[cond]]       <- list(Theta_obs = Theta_use, B = B_tgfb, G = G_hat, times = times_num, p0 = p0)
+  rates_list[[cond]] <- tidy_G_rates(G_hat, cond)
+}
+
+stopifnot(length(rates_list) > 0)
+rates_df <- bind_rows(rates_list)
+
+
+
+
+rates_hm <- rates_df %>%
+  mutate(
+    transition = factor(transition, levels = c("E→H","H→E","H→M","M→H")),
+    condition  = factor(condition,  levels = conditions)
+  )
+
+p_rates <- ggplot(rates_hm, aes(x = condition, y = transition, fill = rate)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(aes(label = sprintf("%.3f", rate)), color = "white", size = 4.2) +
+  scale_fill_gradientn(
+    colours = c("#f3f0ff", "#94B4C1", "#547792", "#213448"),
+    name = "Rate (per day)"
+  ) +
+  labs(
+    title = sprintf("%s – EMT CTMC transition rates (B, p0 from TGFB)", cell_line),
+    x = "Condition", y = "Transition"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        panel.grid = element_blank())
+
+print(p_rates)
+```
+
+
+
+Circular cell cycle fit
+
+```{r}
+traj_long <- purrr::map_dfr(names(fits), function(cond){
+  f <- fits[[cond]]
+  
+  obs <- as_tibble(f$Theta_obs, rownames = "stage") |>
+    pivot_longer(-stage, names_to = "time", values_to = "frac") |>
+    mutate(time = as.numeric(time), type = "Observed", condition = cond)
+ 
+  Theta_hat <- predict_cell_cycle(f$B, f$G, f$times, f$p0)
+  fit <- as_tibble(Theta_hat, rownames = "stage") |>
+    pivot_longer(-stage, names_to = "time", values_to = "frac") |>
+    mutate(time = as.numeric(time), type = "Fitted", condition = cond)
+  bind_rows(obs, fit)
+}) |>
+  mutate(
+    stage     = factor(recode(stage, G1="G1", S="S", G2M="G2M"), levels = c("S","G1","G2M")),
+    condition = factor(condition, levels = conditions),
+    type      = factor(type, levels = c("Observed","Fitted"))
+  )
+
+p_traj <- ggplot(traj_long, aes(x = time, y = frac, color = condition)) +
+  geom_line(aes(linetype = type, group = interaction(condition, stage, type)), linewidth = 1, na.rm = TRUE) +
+  geom_point(data = ~ dplyr::filter(.x, type == "Observed"),
+             aes(shape = stage, group = interaction(condition, stage)), size = 2, alpha = 0.95, na.rm = TRUE) +
+  scale_linetype_manual(values = c(Observed = "solid", Fitted = "22")) +
+  scale_shape_manual(values = c(S = 16, G1 = 17, G2M = 15)) +
+  scale_y_continuous(limits = c(0, 1), expand = expansion(mult = c(0.02, 0.04))) +
+  labs(
+    title = sprintf("%s — Cell-cycle trajectories (Observed vs Fitted; B, p0 from TGFB)", cell_line),
+    x = "Time (days)", y = "Fraction", color = "Condition", shape = "Stage", linetype = ""
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "bottom")
+
+print(p_traj)
+# ggsave(sprintf("%s_traj_sharedB_p0TGFB.png", cell_line), p_traj, width = 9, height = 5, dpi = 300)
+
+
+
+###########################################################
+
+
+
+library(dplyr) 
+library(tidyr) 
+library(ggplot2) 
+library(forcats)
+
+
+
+inner_hole <- 50                  
+stage_cols <- c(G1="#513252", G2M="#7A4069", S="#CA4E79")
+ring_vals  <- c(50, 75)          
+outer_pad  <- 8                  
+tick_len   <- 3                   
+label_gap  <- 2                   
+time_levels <- c(0, 0.33, 1, 3, 7)
+
+
+traj_long_id <- traj_long %>%
+  mutate(
+    stage     = fct_relevel(stage, "S","G1","G2M"),
+    condition = factor(condition, levels = c("TGFB","EGF","TNF")),
+    type      = factor(type, levels = c("Observed","Fitted"))
+  )
+
+time_index <- traj_long_id %>%
+  distinct(condition, time) %>%
+  arrange(condition, time) %>%
+  group_by(condition) %>%
+  mutate(n_in_cond = row_number()) %>%
+  ungroup()
+
+sizes <- time_index %>%
+  count(condition, name = "n") %>%
+  mutate(offset = cumsum(dplyr::lag(n, default = 0)))
+
+time_map <- time_index %>%
+  left_join(sizes, by = "condition") %>%
+  mutate(id = n_in_cond + offset) %>%
+  select(condition, time, id, n, offset)
+
+
+stage_index <- setNames(1:3, c("S","G1","G2M"))
+stage_w     <- 1/3
+
+obs_bars <- traj_long_id %>%
+  filter(type == "Observed") %>%
+  left_join(time_map, by = c("condition","time")) %>%
+  mutate(
+    value    = 100 * frac,
+    s_idx    = stage_index[as.character(stage)],
+    x_center = id + (s_idx - 2) * stage_w,  
+    x_left   = x_center - stage_w/2,
+    x_right  = x_center + stage_w/2,
+    y_bot    = inner_hole,
+    y_top    = inner_hole + value
+  )
+
+fit_lines <- traj_long_id %>%
+  filter(type == "Fitted") %>%
+  left_join(time_map, by = c("condition","time")) %>%
+  mutate(
+    value    = 100 * frac,
+    s_idx    = stage_index[as.character(stage)],
+    x_center = id + (s_idx - 2) * stage_w,
+    y_plot   = inner_hole + value
+  ) %>%
+  arrange(condition, stage, id)
+
+
+sector_bounds <- time_map %>%
+  group_by(condition) %>%
+  summarise(
+    start_x = min(id) - 0.5,            
+    end_x   = max(id) + 0.5,             
+    mid_x   = (start_x + end_x)/2,
+    .groups = "drop"
+  )
+
+
+ring_lines <- tidyr::crossing(
+  sector_bounds %>% transmute(start = start_x, end = end_x),
+  y = inner_hole + ring_vals
+)
+
+
+ring_labels <- sector_bounds %>%
+  tidyr::crossing(y = inner_hole + ring_vals) %>%
+  mutate(label = paste0(y - inner_hole, "%")) %>%
+  transmute(x = end_x - 0.6, y = y, label = label)
+
+
+separators <- sector_bounds %>%
+  tidyr::pivot_longer(c(start_x, end_x), names_to = "side", values_to = "x") %>%
+  transmute(
+    x  = x,
+    y0 = inner_hole,                        
+    y1 = inner_hole + 100 + outer_pad        
+  )
+
+
+title_data <- sector_bounds %>%
+  transmute(x = mid_x, y = inner_hole - 6, lab = as.character(condition))
+
+
+max_edge <- max(sector_bounds$end_x)
+
+time_rim <- time_map %>%
+  mutate(
+    time_lab = factor(time, levels = time_levels,
+                      labels = c("0","0.33","1","3","7"))
+  ) %>%
+  distinct(condition, time, id, time_lab, .keep_all = TRUE)
+
+ticks <- time_rim %>%
+  transmute(
+    x  = id,
+    y0 = inner_hole + 100 + outer_pad - (tick_len + label_gap),
+    y1 = inner_hole + 100 + outer_pad -  label_gap
+  )
+
+labels <- time_rim %>%
+  mutate(
+    angle = 90 - 360 * (id / max_edge),
+    hjust = ifelse(angle < -90, 1, 0),
+    angle = ifelse(angle < -90, angle + 180, angle),
+    rlab  = inner_hole + 100 + outer_pad
+  )
+
+
+p_circ <- ggplot() +
+
+  geom_segment(data = ring_lines,
+               aes(x = end, y = y, xend = start, yend = y),
+               inherit.aes = FALSE, color = "grey55", alpha = 0.25, linewidth = 0.6) +
+ 
+  geom_rect(data = obs_bars,
+            aes(xmin = x_left, xmax = x_right, ymin = y_bot, ymax = y_top, fill = stage),
+            color = NA, alpha = 0.92) +
+  scale_fill_manual(values = stage_cols, name = "Stage") +
+
+  geom_path(data = fit_lines,
+            aes(x = x_center, y = y_plot, color = stage,
+                group = interaction(condition, stage)),
+            linewidth = 1.25, alpha = 0.95, lineend = "round") +
+  scale_color_manual(values = stage_cols, guide = "none") +
+
+  geom_label(data = ring_labels,
+             aes(x = x, y = y, label = label),
+             size = 3.0, label.size = 0, fill = "white", alpha = 0.85) +
+ 
+  geom_segment(data = separators,
+               aes(x = x, xend = x, y = y0, yend = y1),
+               inherit.aes = FALSE, color = "black", linewidth = 1.4, lineend = "butt") +
+ 
+  geom_segment(data = sector_bounds,
+               aes(x = start_x, y = inner_hole, xend = end_x, yend = inner_hole),
+               inherit.aes = FALSE, color = "black", linewidth = 0.8) +
+  geom_text(data = title_data,
+            aes(x = x, y = y, label = lab),
+            size = 4.2, fontface = "bold") +
+
+  geom_segment(data = ticks,
+               aes(x = x, xend = x, y = y0, yend = y1),
+               inherit.aes = FALSE, linewidth = 0.6, color = "grey25") +
+  geom_text(data = labels,
+            aes(x = id, y = rlab, label = time_lab, hjust = hjust),
+            angle = labels$angle, size = 3.0, color = "grey15") +
+
+  scale_x_continuous(breaks = NULL) +
+  coord_polar() +
+  ylim(0, inner_hole + 100 + outer_pad) +
+  labs(
+    title    = sprintf("%s — Cell-cycle (Observed grouped bars) with Fitted trajectories", cell_line),
+    subtitle = "Circular layout with sectors: TGFB | EGF | TNF",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+print(p_circ)
+
+```
+
+
+EMT trajectories
+
+
+```{r}
+safe_expm <- function(M){
+  if (!all(is.finite(M))) return(NULL)
+  tryCatch(expm::expm(M), error = function(e) NULL)
+}
+predict_emt <- function(G, times, p0){
+  t0 <- min(times)
+  P  <- matrix(NA_real_, nrow = 3, ncol = length(times),
+               dimnames = list(c("E","H","M"), as.character(times)))
+  for (i in seq_along(times)){
+    S <- safe_expm(t(G) * (times[i] - t0))
+    P[, i] <- as.numeric(S %*% p0)
+  }
+  apply(P, 2, function(x){ x <- pmax(x, 0); s <- sum(x); if (s > 0) x/s else rep(1/3,3) })
+}
+
+
+emt_fit_long <- purrr::map_dfr(names(fits), function(cond){
+  f <- fits[[cond]]
+  P_hat <- predict_emt(f$G, f$times, f$p0)
+  as_tibble(P_hat, rownames = "state") |>
+    pivot_longer(-state, names_to = "time", values_to = "frac") |>
+    mutate(condition = cond, time = as.numeric(time))
+}) %>%
+  mutate(
+    state     = factor(state, levels = c("E","H","M")),
+    condition = factor(condition, levels = c("TGFB","EGF","TNF"))
+  )
+
+
+state_cols     <- c(E = "#BEAEE2", H = "#F7DBF0", M = "#CDF0EA")
+alpha_vals     <- c(TGFB = 1.00, EGF = 0.85, TNF = 0.65)   # in [0,1]
+linewidth_vals <- c(TGFB = 1.8,  EGF = 1.8,  TNF = 1.8)
+linetype_vals  <- c(TGFB = "solid", EGF = "dashed", TNF = "dotted")
+
+
+p_emt <- ggplot(
+  emt_fit_long,
+  aes(x = time, y = frac, color = state,
+      linetype = condition, alpha = condition, linewidth = condition,
+      group = interaction(state, condition))
+) +
+  geom_line(lineend = "round") +
+  scale_color_manual(values = state_cols, name = "EMT state") +
+  scale_linetype_manual(values = linetype_vals, guide = "legend") +
+  scale_alpha_manual(values = alpha_vals, guide = "none") +
+  scale_linewidth_manual(values = linewidth_vals, guide = "none") +
+  scale_y_continuous(limits = c(0, 1), expand = expansion(mult = c(0.02, 0.06))) +
+  scale_x_continuous(breaks = sort(unique(emt_fit_long$time))) +
+  labs(
+    title = sprintf("%s", cell_line),
+    x = "Time (days)", y = "Fraction"
+  ) +
+  facet_wrap(~ state, nrow = 1) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom"
+  )+
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 18, hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(size = 14, hjust = 0.5),
+    axis.text = element_text(size = 13),
+    axis.title = element_text(size = 15),
+    legend.position = "bottom",
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12),
+    panel.border = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    axis.line = element_line(color = "black")
+  )
+
+p_emt <- p_emt + scale_x_continuous(breaks = c(0, 1, 3, 7))
+
+print(p_emt)
+```
+
+
+
+

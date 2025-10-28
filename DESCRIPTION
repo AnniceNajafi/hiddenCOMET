@@ -1,0 +1,37 @@
+Package: hiddenCOMET
+Title: Hidden Markov Models for EMT and Cellular Processes
+Version: 1.0.0
+Authors@R:
+   c(
+     person(
+       given  = "Annice",
+       family = "Najafi",
+       email  = "annicenajafi27@gmail.com",
+       role   = c("aut", "cre")
+     )
+   )
+Maintainer: Annice Najafi <annicenajafi27@gmail.com>
+Description: Provides functions for fitting continuous-time Markov chain (CTMC) models 
+    with hidden states, specifically designed for analyzing epithelial-mesenchymal 
+    transition (EMT) dynamics coupled with secondary cellular processes such as 
+    cell cycle progression. The package includes methods for estimating emission 
+    matrices from time-course data and fitting generator matrices using maximum 
+    likelihood estimation.
+License: MIT
+Encoding: UTF-8
+LazyData: true
+Imports:
+    expm,
+    MASS,
+    stats,
+    shiny,
+    shinyvalidate,
+    tidyverse,
+    DT,
+    plotly,
+    shinycssloaders
+Suggests:
+    testthat,
+    knitr,
+    rmarkdown
+RoxygenNote: 7.3.3

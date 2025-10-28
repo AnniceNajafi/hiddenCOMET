@@ -23,13 +23,7 @@ LazyData: true
 Imports:
     expm,
     MASS,
-    stats,
-    shiny,
-    shinyvalidate,
-    tidyverse,
-    DT,
-    plotly,
-    shinycssloaders
+    stats
 Suggests:
     testthat,
     knitr,

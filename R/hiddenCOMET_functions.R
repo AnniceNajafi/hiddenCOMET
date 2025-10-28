@@ -90,25 +90,32 @@ check_matrix_conditioning <- function(G) {
 build_G <- function(rates, states){
   n <- length(states)
   
-  if(n != 3 || !identical(states, c("E", "H", "M"))) {
-    stop("This function only works for 3 states: E, H, M")
-  }
-  if(length(rates) != 4) {
-    stop("Need exactly 4 rates: c(muE, muM, lamE, lamM)")
+  # For linear topology, need 2*(n-1) rates
+  if(length(rates) != 2*(n-1)) {
+    stop(paste("Need exactly", 2*(n-1), "rates for", n, "states with linear topology"))
   }
   
-  # Direct parameterization matching the app:
-  # rates = c(muE, muM, lamE, lamM)
-  muE  <- rates[1]  # E → H
-  muM  <- rates[2]  # M → H  
-  lamE <- rates[3]  # H → E
-  lamM <- rates[4]  # H → M
+  # Build generator matrix for linear topology: 1 <-> 2 <-> 3 <-> ... <-> n
+  G <- matrix(0, n, n)
   
-  G <- rbind(c(-muE,         muE,           0),
-             c(lamE,  -(lamE+lamM),      lamM),
-             c(0,            muM,        -muM))
+  # Fill diagonal elements (negative row sums)
+  for(i in 1:n) {
+    if(i == 1) {
+      G[i,i] <- -rates[1]  # Only forward transition
+    } else if(i == n) {
+      G[i,i] <- -rates[2*(n-1)]  # Only backward transition
+    } else {
+      G[i,i] <- -(rates[2*i-1] + rates[2*i])  # Both forward and backward
+    }
+  }
   
-  rownames(G) <- colnames(G) <- c("E", "H", "M")
+  # Fill off-diagonal elements
+  for(i in 1:(n-1)) {
+    G[i, i+1] <- rates[2*i-1]    # Forward transition
+    G[i+1, i] <- rates[2*i]      # Backward transition
+  }
+  
+  rownames(G) <- colnames(G) <- states
   
   if(!check_matrix_conditioning(G)) {
     diag(G) <- diag(G) - 1e-6

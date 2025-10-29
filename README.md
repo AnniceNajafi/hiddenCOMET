@@ -15,6 +15,10 @@ The package Supports for any number of observed states with fixed 3-state EMT mo
 ```r
 devtools::install_github("AnniceNajafi/hiddenCOMET")
 ```
+## Load Package
+```r
+library(hiddenCOMET)
+```
 
 Please follow the below steps to run the pipeline
 

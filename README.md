@@ -112,7 +112,7 @@ If you use `hiddenCOMET` in your research, please cite:
 @software{hiddenCOMET2025,
   title={hiddenCOMET: Hidden Markov Models for EMT and Cellular Processes},
   author={Annice Najafi},
-  year={2024},
+  year={2025},
   url={https://github.com/AnniceNajafi/hiddenCOMET}
 }
 ```
